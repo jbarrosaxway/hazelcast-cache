@@ -1,0 +1,6 @@
+{
+    "java.project.referencedLibraries": [
+        "lib/**/*.jar",
+        "c:\\Axway-7.7.20230830\\apigateway\\system\\lib\\hazelcast-all-4.2.8.jar"
+    ]
+}

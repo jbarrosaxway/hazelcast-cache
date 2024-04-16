@@ -1,0 +1,4 @@
+<typeSet>
+ <typedoc file="HazelcastCacheManagerLoadableModule.xml"/>
+ <typedoc file="instance.xml"/>
+</typeSet>

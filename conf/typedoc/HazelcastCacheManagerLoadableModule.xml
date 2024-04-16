@@ -1,0 +1,6 @@
+<entityStoreData>
+ <entityType name="HazelcastCacheManagerLoadableModule" extends="NamedLoadableModule">
+    <constant name="class" type="string" value="com.axway.hazelcast.HazelcastCacheManager"/>
+    <constant name="loadorder" type="integer" value="1000000"/>
+ </entityType>
+</entityStoreData>

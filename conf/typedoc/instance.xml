@@ -1,0 +1,8 @@
+<entityStoreData>
+ <entity type="HazelcastCacheManagerLoadableModule">
+    <fval name="name">
+      <value>Hazelcast Cache Manager</value>
+    </fval>
+    <!-- Outros campos de configuração personalizados aqui -->
+ </entity>
+</entityStoreData>

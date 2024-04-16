@@ -1,0 +1,47 @@
+<?xml version="1.0"?>
+<project name="hazelcastmodule" default="jar" basedir=".">
+    <property environment="env" />
+
+    <path id="classpath">
+        <fileset dir="${env.VORDEL_HOME}/system/lib">
+            <include name="vordel-api-model-*.jar"/>
+            <include name="vordel-core-runtime-*.jar"/>
+            <include name="vordel-persistence-*.jar"/>
+            <include name="hazelcast-all-*.jar"/>
+
+        </fileset>
+        <fileset dir="${env.VORDEL_HOME}/system/lib/plugins">
+            <include name="vordel-circuit-*.jar" />
+            <include name="vordel-common-*.jar" />
+            <include name="es-core-*.jar" />
+            <include name="vordel-config-*.jar" />
+            <include name="vordel-trace-*.jar" />
+            <include name="apigw-common-*.jar" />
+        	<include name="el*.jar" />
+        	<include name="kps*.jar" />
+        	<include name="cassandra*.jar" />
+        </fileset>        
+    	<fileset dir="${env.VORDEL_HOME}/system/lib/modules/cassandra/client">
+    	        	<include name="*.jar" />
+    	</fileset>  
+    </path>
+
+    <target name="clean">
+        <delete dir="build" />
+    </target>
+
+    <target name="compile">
+        <mkdir dir="build/classes" />
+            <javac srcdir="src" destdir="build/classes" debug="true">
+                <classpath refid="classpath" />
+            </javac>
+    </target>
+
+    <target name="jar" depends="clean, compile">
+        <mkdir dir="build/jar" />
+        <jar destfile="build/jar/hazelcastmodule.jar" basedir="build/classes"/>            
+    </target>
+
+</project>
+
+
