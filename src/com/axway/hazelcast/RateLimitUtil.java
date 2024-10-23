@@ -75,7 +75,7 @@ public class RateLimitUtil {
         ClusterConnectionPool cassandraConnectionPool = CassandraObjectFactory.getClusterConnectionPool();
         Session session = cassandraConnectionPool.getSession();
         String keyspace = cassandraConnectionPool.getKeySpace();
-        String table = "\"Bradesco_RateLimit\"";
+        String table = "\"Axway_RateLimit\"";
         table = table.toLowerCase();
         ConsistencyLevel rcLevel = ConsistencyLevel.valueOf(BasicDmlOperations.readConsistencies.getOrDefault(getFullyQualifiedTable(keyspace, table), "ONE"));
         
