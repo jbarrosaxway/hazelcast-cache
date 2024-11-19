@@ -48,6 +48,10 @@ public class HazelcastCacheManager implements LoadableModule {
 
         
         Config config = new Config();
+        
+        // Configuração simplificada do CP Subsystem
+        configureCPSubsystem(config, props);
+        
         config.getNetworkConfig().setPort(Integer.parseInt(port));
         
                 
@@ -129,6 +133,17 @@ public class HazelcastCacheManager implements LoadableModule {
         Trace.info("Hazelcast Instance iniciado.");
 
 
+    }
+    
+    private void configureCPSubsystem(Config config, Properties props) {
+        // Por padrão, define cp-member-count como 0 para desabilitar o CP Subsystem
+        // O CP Subsystem será habilitado automaticamente quando necessário       
+        config.getCPSubsystemConfig()
+	        .setCPMemberCount(Integer.parseInt(props.getProperty("env.HAZELCAST.cp.member.count", "0")))
+	        .setSessionTimeToLiveSeconds(Integer.parseInt(props.getProperty("env.HAZELCAST.cp.session.ttl.seconds", "300")))
+	        .setSessionHeartbeatIntervalSeconds(Integer.parseInt(props.getProperty("env.HAZELCAST.cp.session.heartbeat.interval.seconds", "5")));
+
+        Trace.info("CP Subsystem configurado com configuração padrão");
     }
 
     @Override
