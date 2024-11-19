@@ -1,23 +1,24 @@
 package com.axway.hazelcast;
 
-import com.vordel.config.LoadableModule;
-import com.vordel.config.ConfigContext;
-import com.vordel.es.EntityStoreException;
-import com.vordel.trace.Trace;
-
+import java.io.File;
 import java.io.FileInputStream;
 import java.io.IOException;
 import java.util.Properties;
 
+import com.hazelcast.config.Config;
+import com.hazelcast.config.EvictionConfig;
+import com.hazelcast.config.EvictionPolicy;
+import com.hazelcast.config.JoinConfig;
+import com.hazelcast.config.KubernetesConfig;
+import com.hazelcast.config.MaxSizePolicy;
+import com.hazelcast.config.NetworkConfig;
+import com.hazelcast.config.TcpIpConfig;
 import com.hazelcast.core.Hazelcast;
 import com.hazelcast.core.HazelcastInstance;
-
-
-import com.hazelcast.config.Config;
-import com.hazelcast.config.JoinConfig;
-import com.hazelcast.config.NetworkConfig;
-import com.hazelcast.config.KubernetesConfig;
-import com.hazelcast.config.TcpIpConfig;
+import com.vordel.config.ConfigContext;
+import com.vordel.config.LoadableModule;
+import com.vordel.es.EntityStoreException;
+import com.vordel.trace.Trace;
 
 
 public class HazelcastCacheManager implements LoadableModule {
@@ -50,6 +51,12 @@ public class HazelcastCacheManager implements LoadableModule {
         Config config = new Config();
         config.getNetworkConfig().setPort(Integer.parseInt(port));
         
+        // Configurações existentes...
+        configureCacheSettings(config, props);
+        configureCPSubsystem(config, props);
+        
+        // Adicionar configuração de locks
+        configureLockSettings(config, props);
                 
         // Configurações de diagnóstico
         // Habilitar o diagnóstico
@@ -185,5 +192,98 @@ public class HazelcastCacheManager implements LoadableModule {
             kubernetesConfig.setProperty("service-port", servicePort);
         }
     }
+    
+    
+    private void configureLockSettings(Config config, Properties props) {
+        // Configurações específicas para locks
+        config.setProperty("hazelcast.lock.max.lease.time.seconds", 
+            props.getProperty("env.HAZELCAST.lock.max.lease.time.seconds", "30"));
+        
+        // Limitar o número máximo de locks
+        config.setProperty("hazelcast.map.lock.max.waiting.operations", 
+            props.getProperty("env.HAZELCAST.map.lock.max.waiting.operations", "100"));
+    }
 
+    
+    private void configureCacheSettings(Config config, Properties props) {
+        // Configuração global para todos os maps
+        config.getMapConfig("default")
+              .setBackupCount(Integer.parseInt(props.getProperty("env.HAZELCAST.map.backup.count", "0")))
+              .setAsyncBackupCount(Integer.parseInt(props.getProperty("env.HAZELCAST.map.async.backup.count", "0")))
+              .setTimeToLiveSeconds(Integer.parseInt(props.getProperty("env.HAZELCAST.map.ttl.seconds", "300")))
+              .setMaxIdleSeconds(Integer.parseInt(props.getProperty("env.HAZELCAST.map.idle.seconds", "60")))
+              // Adicione esta linha para habilitar estatísticas por entrada
+              .setPerEntryStatsEnabled(true)
+              .setEvictionConfig(
+                  new EvictionConfig()
+                      .setEvictionPolicy(EvictionPolicy.valueOf(props.getProperty("env.HAZELCAST.map.eviction.policy", "LRU")))
+                      .setMaxSizePolicy(MaxSizePolicy.valueOf(props.getProperty("env.HAZELCAST.map.eviction.max.size.policy", "PER_NODE")))
+                      .setSize(Integer.parseInt(props.getProperty("env.HAZELCAST.map.eviction.size", "10000")))
+              );
+
+        // Configuração específica para maps de rate limit
+        config.getMapConfig("rateLimit*")
+              .setBackupCount(0) // Sem backup para rate limiting
+              .setAsyncBackupCount(0)
+              .setTimeToLiveSeconds(5) // TTL mínimo de 5 segundos
+              .setMaxIdleSeconds(5)    // Idle mínimo de 5 segundos
+              // Adicione esta linha para habilitar estatísticas por entrada
+              .setPerEntryStatsEnabled(true)
+              .setEvictionConfig(
+                  new EvictionConfig()
+                      .setEvictionPolicy(EvictionPolicy.LRU)
+                      .setMaxSizePolicy(MaxSizePolicy.PER_NODE)
+                      .setSize(Integer.parseInt(props.getProperty("env.HAZELCAST.ratelimit.map.eviction.size", "100000")))
+              );
+    }
+
+    private void configureCPSubsystem(Config config, Properties props) {
+        // Configuração básica do CP Subsystem
+        config.getCPSubsystemConfig()
+            // Define o número de membros CP (0 desabilita o CP Subsystem)
+            .setCPMemberCount(Integer.parseInt(props.getProperty("env.HAZELCAST.cp.member.count", "0")))
+            
+            // Define o tamanho do grupo CP (deve ser ímpar entre 3 e 7)
+            .setGroupSize(Integer.parseInt(props.getProperty("env.HAZELCAST.cp.group.size", "0")))
+            
+            // Configuração de sessão
+            .setSessionTimeToLiveSeconds(
+                Integer.parseInt(props.getProperty("env.HAZELCAST.cp.session.ttl.seconds", "300")))
+            .setSessionHeartbeatIntervalSeconds(
+                Integer.parseInt(props.getProperty("env.HAZELCAST.cp.session.heartbeat.interval.seconds", "5")))
+            
+            // Configuração de remoção automática de membros
+            .setMissingCPMemberAutoRemovalSeconds(
+                Integer.parseInt(props.getProperty("env.HAZELCAST.cp.missing.member.auto.removal.seconds", "14400")))
+            
+            // Configuração de persistência
+            .setPersistenceEnabled(
+                Boolean.parseBoolean(props.getProperty("env.HAZELCAST.cp.persistence.enabled", "false")))
+            .setBaseDir(new File(props.getProperty("env.HAZELCAST.cp.base.dir", "cp-data")))
+            
+            // Configuração de comportamento de operações indeterminadas
+            .setFailOnIndeterminateOperationState(
+                Boolean.parseBoolean(props.getProperty("env.HAZELCAST.cp.fail.on.indeterminate.state", "false")));
+
+        // Configuração do algoritmo Raft
+        config.getCPSubsystemConfig().getRaftAlgorithmConfig()
+            .setLeaderElectionTimeoutInMillis(
+                Integer.parseInt(props.getProperty("env.HAZELCAST.cp.raft.leader.election.timeout.millis", "2000")))
+            .setLeaderHeartbeatPeriodInMillis(
+                Integer.parseInt(props.getProperty("env.HAZELCAST.cp.raft.leader.heartbeat.period.millis", "5000")))
+            .setMaxMissedLeaderHeartbeatCount(
+                Integer.parseInt(props.getProperty("env.HAZELCAST.cp.raft.max.missed.leader.heartbeat.count", "5")))
+            .setAppendRequestMaxEntryCount(
+                Integer.parseInt(props.getProperty("env.HAZELCAST.cp.raft.append.request.max.entry.count", "100")))
+            .setCommitIndexAdvanceCountToSnapshot(
+                Integer.parseInt(props.getProperty("env.HAZELCAST.cp.raft.commit.index.advance.count.to.snapshot", "10000")))
+            .setUncommittedEntryCountToRejectNewAppends(
+                Integer.parseInt(props.getProperty("env.HAZELCAST.cp.raft.uncommitted.entry.count.to.reject.new.appends", "100")))
+            .setAppendRequestBackoffTimeoutInMillis(
+                Integer.parseInt(props.getProperty("env.HAZELCAST.cp.raft.append.request.backoff.timeout.millis", "100")));
+            
+        Trace.info("CP Subsystem configurado com sucesso");
+    }
+
+    
 }

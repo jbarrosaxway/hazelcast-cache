@@ -4,7 +4,6 @@ import java.util.ArrayList;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
-import java.util.Set;
 import java.util.concurrent.TimeUnit;
 
 import com.axway.apigw.cassandra.api.ClusterConnectionPool;
@@ -31,7 +30,7 @@ public class RateLimitUtil {
     private RateLimitUtil() {}
     
     private HazelcastInstance hazelcastInstance;
-    private static boolean isTtlEnabled = true;
+    
 
     public static RateLimitUtil getInstance() {
         return instance;
@@ -170,11 +169,9 @@ public class RateLimitUtil {
 	                IMap<String, Long> map = getHazelcastInstance().getMap(mapName);
 	                
 	                int rate = 0;
-					if (isTtlEnabled) {
-						rate = validateRateLimitWithTTL(map);
-					} else {
-						rate = validateRateLimitWithoutTTL(timeInterval, timeUnit, map);
-					}
+
+					rate = validateRateLimitWithTTL(map);
+
 	                
 	        		// Atualiza a contagem para incluir a chamada atual
 	                rate += 1;
@@ -189,11 +186,7 @@ public class RateLimitUtil {
 	        		    // Armazena a nova requisição com o timestamp atual
 	        			String identificadorReq = ""+msg.correlationId+"";
 	        			Trace.debug("Identificador da requisição: " + identificadorReq);
-	        			if (isTtlEnabled) {
-	        				map.put(identificadorReq, currentTime, timeInterval, timeUnit);
-	        			} else {
-	        				map.put(identificadorReq, currentTime);
-	        			}
+        				map.put(identificadorReq, currentTime, timeInterval, timeUnit);
 	        		    Trace.debug("Rate limit applied for " + mapName + ". Current count: " + rate);
 	        		}
 	                
@@ -211,45 +204,9 @@ public class RateLimitUtil {
     }
 
 	private int validateRateLimitWithTTL(IMap<String, Long> map) {
-		Set<String> keys = map.keySet();
-		Trace.debug("Keys: " + keys);
-		int rate = keys.size(); // Include current call in rate limit
+		int rate = map.size(); // Include current call in rate limit
+		Trace.debug("Rate: " + rate);
 		return rate;
-	}
-	
-	private int validateRateLimitWithoutTTL(Integer timeInterval,
-			TimeUnit timeUnit, IMap<String, Long> map) {
-		Set<String> keys = map.keySet();
-		Trace.debug("Keys: " + keys);
-		// Supondo que 'map' é um IMap<String, Long>, onde o valor é o timestamp da requisição
-		long currentTime = System.currentTimeMillis();
-		long ttlMillis = TimeUnit.MILLISECONDS.convert(timeInterval, timeUnit);
-
-		// Calcula o limiar de tempo para considerar uma requisição expirada
-		long expiredTimeThreshold = currentTime - ttlMillis;
-		int validRequestCount = 0;
-
-		// Cria uma lista temporária para armazenar as chaves das requisições expiradas
-		List<String> expiredKeys = new ArrayList<>();
-
-		for (String key : keys) {
-		    Long requestTime = map.get(key);
-		    if (requestTime != null && requestTime > expiredTimeThreshold) {
-		        validRequestCount++;
-		    } else {
-		        // Adiciona chaves expiradas à lista temporária
-		        expiredKeys.add(key);
-		    }
-		}
-
-		// Remove as chaves expiradas do mapa
-		for (String expiredKey : expiredKeys) {
-		    map.remove(expiredKey);
-		}
-
-		return validRequestCount;
-	}
-    
-    
+	}    
     
 }
