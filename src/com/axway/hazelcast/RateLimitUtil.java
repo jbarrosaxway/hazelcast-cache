@@ -4,6 +4,8 @@ import java.util.ArrayList;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.concurrent.Executors;
+import java.util.concurrent.ScheduledExecutorService;
 import java.util.concurrent.TimeUnit;
 
 import com.axway.apigw.cassandra.api.ClusterConnectionPool;
@@ -27,13 +29,19 @@ import com.vordel.trace.Trace;
 
 public class RateLimitUtil {
     private static final RateLimitUtil instance = new RateLimitUtil();
+    
+    private final ScheduledExecutorService scheduler = Executors.newSingleThreadScheduledExecutor();
 
-    private RateLimitUtil() {}
+    private RateLimitUtil() {
+        // Agenda a limpeza para executar a cada hora
+        scheduler.scheduleAtFixedRate(this::cleanupExpiredCounters, 1, 1, TimeUnit.HOURS);
+    	
+    }
     
     private HazelcastInstance hazelcastInstance;
     
 	// Adicionar esta constante
-	private static final String RATE_LIMITER_PREFIX = "ratelimit_";
+	private static final String RATE_LIMITER_PREFIX = "rate-limit.";
 
     public static RateLimitUtil getInstance() {
         return instance;
@@ -139,20 +147,24 @@ public class RateLimitUtil {
             return true;
         } else {
             for (Map<String, Object> rateLimit : rateLimits) {
-                boolean isValid = true;
                 String rateLimitKeyBD = (String) rateLimit.get("rateLimitkey");
                 Trace.debug("Rate limit key: " + rateLimitKeyBD);
                 String rateLimitKeySelector = (String) rateLimit.get("rateLimitkeySelector");
                 Trace.debug("Rate limit key selector: " + rateLimitKeySelector);
                 
-                if (isRateLimitApplicable(msg, rateLimitKeyBD, rateLimitKeySelector, userKeySelectorParam)) {
+                String[] result = isRateLimitApplicable(msg, rateLimitKeyBD, rateLimitKeySelector, userKeySelectorParam);
+                boolean isApplicable = Boolean.parseBoolean(result[0]);
+                String selectorValue = result[1];
+                
+                if (isApplicable) {
+                	boolean isValid = true;
                     Number rateLimitValue = Long.parseLong((String)rateLimit.get("rateLimit"));
                     Integer timeInterval = Integer.parseInt((String)rateLimit.get("timeInterval"));
                     String timeUnitStr = (String) rateLimit.get("timeUnit");
                     TimeUnit timeUnit = mapStringToTimeUnit(timeUnitStr);
                     
                     
-                    String counterName = RATE_LIMITER_PREFIX + rateLimitKeyBD;
+                    String counterName = RATE_LIMITER_PREFIX + selectorValue;
                     IAtomicLong counter = getOrCreateCounter(counterName);
                     
                     if (counter == null) {
@@ -182,9 +194,9 @@ public class RateLimitUtil {
                     }
                     
                     // Atualiza métricas na mensagem
-                    msg.put("rate-limit." + counterName + ".is-exceeded", !isValid);
+                    msg.put(counterName + ".is-exceeded", !isValid);
                     long remain = rateLimitValue.longValue() - currentCount;
-                    msg.put("rate-limit." + counterName + ".remain", !isValid ? 0 : remain);
+                    msg.put(counterName + ".remain", !isValid ? 0 : remain);
                     
                     return isValid;
                 }
@@ -206,41 +218,52 @@ public class RateLimitUtil {
     }
 
 
-	private boolean isRateLimitApplicable(Message msg, String rateLimitKeyBD, String rateLimitKeySelector,
-			String userKeySelectorParam) {
-		Selector<String> keySelector = new Selector<>(rateLimitKeySelector, String.class);
-		Selector<String> key = new Selector<>(rateLimitKeyBD, String.class);
-		Selector<String> userKeySelector = new Selector<>(userKeySelectorParam, String.class);
+    private String[] isRateLimitApplicable(Message msg, String rateLimitKeyBD, String rateLimitKeySelector,
+            String userKeySelectorParam) {
+        Selector<String> keySelector = new Selector<>(rateLimitKeySelector, String.class);
+        Selector<String> key = new Selector<>(rateLimitKeyBD, String.class);
+        Selector<String> userKeySelector = new Selector<>(userKeySelectorParam, String.class);
 
-		String selectorValue = keySelector.substitute(msg);
-		String selectorKey = key.substitute(msg);
-		String userKey = userKeySelector.substitute(msg);
+        String selectorValue = keySelector.substitute(msg);
+        String selectorKey = key.substitute(msg);
+        String userKey = userKeySelector.substitute(msg);
 
-		Trace.debug("Evaluator: " + selectorKey + ".equals(" + selectorValue + ") && " + selectorKey + ".equals("
-				+ userKey + ")");
+        Trace.debug("Evaluator: " + selectorKey + ".equals(" + selectorValue + ") && " + selectorKey + ".equals("
+                + userKey + ")");
 
-		return selectorKey.equals(selectorValue) && selectorKey.equals(userKey);
-	}
+        // Retorna um array com o resultado da validação e o selectorValue
+        return new String[]{String.valueOf(selectorKey.equals(selectorValue) && selectorKey.equals(userKey)), selectorValue};
+    }
 	
-	public void destroy() {
-	    try {
-	        // Limpa todos os contadores
-	        IMap<String, Long> expirationMap = getHazelcastInstance().getMap(RATE_LIMITER_PREFIX+"expiration");
-	        for (String counterName : expirationMap.keySet()) {
-	            IAtomicLong counter = getHazelcastInstance().getCPSubsystem().getAtomicLong(counterName);
-	            counter.destroy();
-	        }
-	        expirationMap.clear();
-	        
-	        // Shutdown da instância do Hazelcast
-	        if (hazelcastInstance != null) {
-	            hazelcastInstance.shutdown();
-	            hazelcastInstance = null;
-	        }
-	    } catch (Exception e) {
-	        Trace.error("Erro ao destruir RateLimitUtil", e);
-	    }
-	}
+    public void destroy() {
+        try {
+            // Primeiro, desliga o scheduler
+            scheduler.shutdown();
+            try {
+                if (!scheduler.awaitTermination(60, TimeUnit.SECONDS)) {
+                    scheduler.shutdownNow();
+                }
+            } catch (InterruptedException e) {
+                scheduler.shutdownNow();
+            }
+
+            // Limpa todos os contadores
+            IMap<String, Long> expirationMap = getHazelcastInstance().getMap(RATE_LIMITER_PREFIX+"expiration");
+            for (String counterName : expirationMap.keySet()) {
+                IAtomicLong counter = getHazelcastInstance().getCPSubsystem().getAtomicLong(counterName);
+                counter.destroy();
+            }
+            expirationMap.clear();
+            
+            // Shutdown da instância do Hazelcast
+            if (hazelcastInstance != null) {
+                hazelcastInstance.shutdown();
+                hazelcastInstance = null;
+            }
+        } catch (Exception e) {
+            Trace.error("Erro ao destruir RateLimitUtil", e);
+        }
+    }
 
     private IAtomicLong getOrCreateCounter(String counterName) {
         try {
