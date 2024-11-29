@@ -4,15 +4,15 @@ import java.util.ArrayList;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.Executors;
 import java.util.concurrent.ScheduledExecutorService;
+import java.util.concurrent.ThreadFactory;
 import java.util.concurrent.TimeUnit;
 
 import com.axway.apigw.cassandra.api.ClusterConnectionPool;
 import com.axway.apigw.cassandra.api.constants.TableEnum;
-import com.axway.apigw.cassandra.api.kps.BasicDmlOperations;
 import com.axway.apigw.cassandra.factory.CassandraObjectFactory;
-import com.datastax.driver.core.BoundStatement;
 import com.datastax.driver.core.ColumnDefinitions;
 import com.datastax.driver.core.ConsistencyLevel;
 import com.datastax.driver.core.PreparedStatement;
@@ -28,24 +28,73 @@ import com.vordel.el.Selector;
 import com.vordel.trace.Trace;
 
 public class RateLimitUtil {
-    private static final RateLimitUtil instance = new RateLimitUtil();
-    
-    private final ScheduledExecutorService scheduler = Executors.newSingleThreadScheduledExecutor();
+    private static volatile RateLimitUtil instance = new RateLimitUtil();
+    private final ScheduledExecutorService scheduler;
+    private volatile HazelcastInstance hazelcastInstance;
 
+    // Usar ThreadLocal para evitar vazamentos de memória
+    private static final ThreadLocal<Map<String, Object>> threadLocalCache = 
+        ThreadLocal.withInitial(HashMap::new);
+
+    private static final String RATE_LIMITER_PREFIX = "rate-limit.";
+    
+    // Constantes para configuração dos schedulers
+    private static final int INITIAL_DELAY = 1;
+    private static final int COUNTER_CLEANUP_PERIOD = 1;
+    private static final int CACHE_CLEANUP_PERIOD = 30;
+    
+    // Cache para PreparedStatements
+    private final Map<String, PreparedStatement> preparedStatementCache = new ConcurrentHashMap<>();
+    
     private RateLimitUtil() {
-        // Agenda a limpeza para executar a cada hora
-        scheduler.scheduleAtFixedRate(this::cleanupExpiredCounters, 1, 1, TimeUnit.HOURS);
-    	
+        scheduler = Executors.newScheduledThreadPool(2, new ThreadFactory() {
+            @Override
+            public Thread newThread(Runnable r) {
+                Thread thread = new Thread(r);
+                thread.setDaemon(true);
+                thread.setName("RateLimit-Scheduler-" + thread.getId());
+                return thread;
+            }
+        });
+        
+        // Agendar limpeza de contadores expirados (a cada 1 hora)
+        scheduler.scheduleAtFixedRate(
+            this::cleanupExpiredCounters, 
+            INITIAL_DELAY, 
+            COUNTER_CLEANUP_PERIOD, 
+            TimeUnit.HOURS
+        );
+        
+        // Agendar limpeza do cache de PreparedStatements (a cada 30 minutos)
+        scheduler.scheduleAtFixedRate(
+            this::cleanupPreparedStatementCache, 
+            INITIAL_DELAY, 
+            CACHE_CLEANUP_PERIOD, 
+            TimeUnit.MINUTES
+        );
+
+        // Adicionar shutdown hook
+        Runtime.getRuntime().addShutdownHook(new Thread(() -> {
+            try {
+                destroy();
+            } catch (Exception e) {
+                Trace.error("Erro durante shutdown do RateLimitUtil", e);
+            }
+        }));
     }
     
-    private HazelcastInstance hazelcastInstance;
-    
-	// Adicionar esta constante
-	private static final String RATE_LIMITER_PREFIX = "rate-limit.";
 
     public static RateLimitUtil getInstance() {
+        if (instance == null) {
+            synchronized (RateLimitUtil.class) {
+                if (instance == null) {
+                    instance = new RateLimitUtil();
+                }
+            }
+        }
         return instance;
     }
+
 
     private HazelcastInstance getHazelcastInstance() {
         hazelcastInstance = Hazelcast.getHazelcastInstanceByName("axway-instance");
@@ -71,73 +120,77 @@ public class RateLimitUtil {
         return keySpace + "." + table;
     }
     
-    private List<Map<String, Object>> getRateLimit(Dictionary msg){
-        IMap<String, List<Map<String, Object>>> cache = getHazelcastInstance().getMap("rateLimitCache")  ;  
+    // Melhorar o gerenciamento de cache
+    private List<Map<String, Object>> getRateLimit(Dictionary msg) {
+        IMap<String, List<Map<String, Object>>> cache = getHazelcastInstance().getMap("rateLimitCache");
         String cacheKey = "rateLimits:cassandra";
 
-        // Verificar se o resultado já está no cache
-        if (cache.containsKey(cacheKey)) {
-            Trace.debug("Cache hit for key: "+cacheKey);
-            return cache.get(cacheKey);
-        }
-        Trace.debug("Cache miss for key: "+cacheKey);
+        return cache.computeIfAbsent(cacheKey, k -> {
+            try {
+                return fetchRateLimitsFromCassandra();
+            } catch (Exception e) {
+                Trace.error("Erro ao buscar rate limits do Cassandra", e);
+                return new ArrayList<>();
+            }
+        });
+    }
 
+    private List<Map<String, Object>> fetchRateLimitsFromCassandra() {
         ClusterConnectionPool cassandraConnectionPool = CassandraObjectFactory.getClusterConnectionPool();
         Session session = cassandraConnectionPool.getSession();
         String keyspace = cassandraConnectionPool.getKeySpace();
-        String table = "\"Axway_RateLimit\"";
-        table = table.toLowerCase();
-        ConsistencyLevel rcLevel = ConsistencyLevel.valueOf(BasicDmlOperations.readConsistencies.getOrDefault(getFullyQualifiedTable(keyspace, table), "ONE"));
+        String table = "\"Axway_RateLimit\"".toLowerCase();
         
-        String select = "SELECT * FROM "+getFullyQualifiedTable(keyspace, table);
+        String select = "SELECT * FROM " + getFullyQualifiedTable(keyspace, table);
         
-        
-        
-        PreparedStatement ps = session.prepare(select).setConsistencyLevel(rcLevel);
-        BoundStatement bound = ps.bind();
-        Trace.debug("select: "+select);
-        Trace.debug("Prepared statement: "+ps.getQueryString());
+        // Usar cache de PreparedStatement
+        PreparedStatement ps = preparedStatementCache.computeIfAbsent(select, 
+            k -> session.prepare(k).setConsistencyLevel(getConsistencyLevel(keyspace, table)));
             
-        ResultSet rs = session.execute((com.datastax.driver.core.Statement) bound);
-
-        Trace.debug("Executed statement, now parsing resultset...");
-
-        if (rs.isExhausted()) {
-            Trace.debug("Result set is empty");
-            Trace.debug("}");
-            return new ArrayList<Map<String,Object>>();
-        }
-        List<Map<String, Object>> results = new ArrayList<>();
+        ResultSet rs = session.execute(ps.bind());
         
-        rs.forEach((row) -> {
-            Map<String, Object> result = new HashMap<>();
-            
-            List<ColumnDefinitions.Definition> defsList = row.getColumnDefinitions().asList();
-            
-            for (ColumnDefinitions.Definition d : defsList) {
-                String name = d.getName();
-                if (TableEnum.KEY.getValue().equals(name))
-                  continue; 
-                String value = row.getString("\"" + name + "\"");
-                 
-                if (value == null)
-                  continue;
-                if(value.startsWith("\"") && value.endsWith("\"")) {
-                	String valueWhitoutQuotes = value.substring(1, value.length() - 1);
-                	Trace.debug(name + " : " + valueWhitoutQuotes);
-                	value = valueWhitoutQuotes;
-                }
-                result.put(name, value);
-              } 
-            Trace.debug("}");        
-            results.add((Map<String, Object>) result);
-        });
-        List<Map<String, Object>> validatedRateLimits = results;
-        cache.put(cacheKey, validatedRateLimits);
-
-        return validatedRateLimits;
+        return processResultSet(rs);
     }
-    
+
+    private List<Map<String, Object>> processResultSet(ResultSet rs) {
+        if (rs.isExhausted()) {
+            return new ArrayList<>();
+        }
+
+        List<Map<String, Object>> results = new ArrayList<>();
+        ColumnDefinitions columnDefs = rs.getColumnDefinitions();
+        
+        for (com.datastax.driver.core.Row row : rs) {
+            Map<String, Object> result = new HashMap<>();
+            for (ColumnDefinitions.Definition def : columnDefs) {
+                String name = def.getName();
+                if (!TableEnum.KEY.getValue().equals(name)) {
+                    String value = row.getString("\"" + name + "\"");
+                    if (value != null) {
+                        result.put(name, value.replaceAll("^\"|\"$", ""));
+                    }
+                }
+            }
+            results.add(result);
+        }
+        return results;
+    }
+
+    // Método para limpar ThreadLocal
+    public void cleanupThreadLocal() {
+        try {
+            Map<String, Object> cache = threadLocalCache.get();
+            if (cache != null) {
+                cache.clear();
+            }
+            threadLocalCache.remove();
+        } catch (Exception e) {
+            Trace.error("Erro ao limpar ThreadLocal: " + e.getMessage());
+        }
+    }
+
+
+
     public boolean validateRateLimit(Message msg, String userKeySelectorParam) {
         List<Map<String, Object>> rateLimits = getRateLimit(msg);
         Trace.debug("Rate limits: " + rateLimits.toString());
@@ -157,12 +210,11 @@ public class RateLimitUtil {
                 String selectorValue = result[1];
                 
                 if (isApplicable) {
-                	boolean isValid = true;
-                    Number rateLimitValue = Long.parseLong((String)rateLimit.get("rateLimit"));
-                    Integer timeInterval = Integer.parseInt((String)rateLimit.get("timeInterval"));
+                    boolean isValid = true;
+                    Number rateLimitValue = Long.parseLong((String) rateLimit.get("rateLimit"));
+                    Integer timeInterval = Integer.parseInt((String) rateLimit.get("timeInterval"));
                     String timeUnitStr = (String) rateLimit.get("timeUnit");
                     TimeUnit timeUnit = mapStringToTimeUnit(timeUnitStr);
-                    
                     
                     String counterName = RATE_LIMITER_PREFIX + selectorValue;
                     IAtomicLong counter = getOrCreateCounter(counterName);
@@ -174,7 +226,7 @@ public class RateLimitUtil {
                     }
                     
                     // Verifica se o contador existe e está dentro do período válido
-                    IMap<String, Long> expirationMap = getHazelcastInstance().getMap(RATE_LIMITER_PREFIX+"expiration");
+                    IMap<String, Long> expirationMap = hazelcastInstance.getMap(RATE_LIMITER_PREFIX + "expiration");
                     Long lastResetTime = expirationMap.get(counterName);
                     
                     if (lastResetTime == null || (currentTime - lastResetTime) >= timeUnit.toMillis(timeInterval)) {
@@ -235,33 +287,61 @@ public class RateLimitUtil {
         return new String[]{String.valueOf(selectorKey.equals(selectorValue) && selectorKey.equals(userKey)), selectorValue};
     }
 	
+
+    
     public void destroy() {
         try {
-            // Primeiro, desliga o scheduler
-            scheduler.shutdown();
-            try {
-                if (!scheduler.awaitTermination(60, TimeUnit.SECONDS)) {
+            Trace.info("Iniciando destruição do RateLimitUtil...");
+        
+            // Desligar o scheduler
+            if (scheduler != null) {
+                scheduler.shutdown();
+                if (!scheduler.awaitTermination(5, TimeUnit.SECONDS)) {
                     scheduler.shutdownNow();
                 }
-            } catch (InterruptedException e) {
-                scheduler.shutdownNow();
             }
-
-            // Limpa todos os contadores
-            IMap<String, Long> expirationMap = getHazelcastInstance().getMap(RATE_LIMITER_PREFIX+"expiration");
-            for (String counterName : expirationMap.keySet()) {
-                IAtomicLong counter = getHazelcastInstance().getCPSubsystem().getAtomicLong(counterName);
-                counter.destroy();
-            }
-            expirationMap.clear();
             
-            // Shutdown da instância do Hazelcast
-            if (hazelcastInstance != null) {
-                hazelcastInstance.shutdown();
-                hazelcastInstance = null;
+            // Limpar cache e fechar recursos do Cassandra
+            synchronized (preparedStatementCache) {
+                preparedStatementCache.clear();
             }
+            closeCassandraResources();
+            
+            // Limpar contadores e mapas do Hazelcast
+            HazelcastInstance hz = getHazelcastInstance();
+            if (hz != null) {
+                try {
+                    // Limpar mapa de expiração
+                    IMap<String, Long> expirationMap = hz.getMap(RATE_LIMITER_PREFIX + "expiration");
+                    if (expirationMap != null) {
+                        expirationMap.keySet().forEach(counterName -> {
+                            try {
+                                IAtomicLong counter = hz.getCPSubsystem().getAtomicLong(counterName);
+                                if (counter != null) {
+                                    counter.destroy();
+                                }
+                            } catch (Exception e) {
+                                Trace.error("Erro ao destruir contador: " + counterName, e);
+                            }
+                        });
+                        expirationMap.clear();
+                    }
+                    
+                    // Limpar cache de rate limits
+                    IMap<String, List<Map<String, Object>>> rateCache = hz.getMap("rateLimitCache");
+                    if (rateCache != null) {
+                        rateCache.clear();
+                    }
+                } catch (Exception e) {
+                    Trace.error("Erro ao limpar mapas do Hazelcast", e);
+                }
+            }
+            
+            Trace.info("RateLimitUtil destruído com sucesso.");
+            
         } catch (Exception e) {
-            Trace.error("Erro ao destruir RateLimitUtil", e);
+            Trace.error("Erro durante destroy do RateLimitUtil", e);
+            throw new RuntimeException("Falha ao destruir RateLimitUtil", e);
         }
     }
 
@@ -271,6 +351,49 @@ public class RateLimitUtil {
         } catch (Exception e) {
             Trace.error("Erro ao obter contador: " + counterName, e);
             return null;
+        }
+    }
+
+    private ConsistencyLevel getConsistencyLevel(String keyspace, String table) {
+        try {
+            // Primeiro, tenta obter a consistência específica da tabela
+            String tableSpecificLevel = System.getProperty(
+                String.format("cassandra.consistency.%s.%s", keyspace, table),
+                System.getProperty("cassandra.consistency.default", "LOCAL_QUORUM")
+            );
+            
+            return ConsistencyLevel.valueOf(tableSpecificLevel.toUpperCase());
+        } catch (IllegalArgumentException e) {
+            Trace.info("Nível de consistência inválido configurado, usando LOCAL_QUORUM como fallback");
+            return ConsistencyLevel.LOCAL_QUORUM;
+        }
+    }
+
+    private void closeCassandraResources() {
+        try {
+            ClusterConnectionPool cassandraConnectionPool = CassandraObjectFactory.getClusterConnectionPool();
+            if (cassandraConnectionPool != null) {
+                Session session = cassandraConnectionPool.getSession();
+                if (session != null && !session.isClosed()) {
+                    session.close();
+                }
+            }
+        } catch (Exception e) {
+            Trace.error("Erro ao fechar recursos do Cassandra", e);
+        }
+    }
+
+
+    private void cleanupPreparedStatementCache() {
+        try {
+            Trace.debug("Iniciando limpeza do cache de PreparedStatements");
+            synchronized (preparedStatementCache) {
+                int sizeBefore = preparedStatementCache.size();
+                preparedStatementCache.clear();
+                Trace.info("Cache de PreparedStatements limpo. Tamanho anterior: " + sizeBefore);
+            }
+        } catch (Exception e) {
+            Trace.error("Erro durante limpeza do cache de PreparedStatements", e);
         }
     }
 			    
