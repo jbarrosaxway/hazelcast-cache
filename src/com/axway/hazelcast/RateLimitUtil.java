@@ -9,19 +9,19 @@ import java.util.concurrent.Executors;
 import java.util.concurrent.ScheduledExecutorService;
 import java.util.concurrent.ThreadFactory;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicLong;
 
 import com.axway.apigw.cassandra.api.ClusterConnectionPool;
 import com.axway.apigw.cassandra.api.constants.TableEnum;
 import com.axway.apigw.cassandra.factory.CassandraObjectFactory;
+import com.axway.hazelcast.fake.FakeAtomicCounter;
+import com.axway.hazelcast.fake.FakeHazelcast;
+import com.axway.hazelcast.fake.FakeMap;
 import com.datastax.driver.core.ColumnDefinitions;
 import com.datastax.driver.core.ConsistencyLevel;
 import com.datastax.driver.core.PreparedStatement;
 import com.datastax.driver.core.ResultSet;
 import com.datastax.driver.core.Session;
-import com.hazelcast.core.Hazelcast;
-import com.hazelcast.core.HazelcastInstance;
-import com.hazelcast.cp.IAtomicLong;
-import com.hazelcast.map.IMap;
 import com.vordel.circuit.Message;
 import com.vordel.common.Dictionary;
 import com.vordel.el.Selector;
@@ -30,7 +30,7 @@ import com.vordel.trace.Trace;
 public class RateLimitUtil {
     private static volatile RateLimitUtil instance = new RateLimitUtil();
     private final ScheduledExecutorService scheduler;
-    private volatile HazelcastInstance hazelcastInstance;
+    //private volatile HazelcastInstance hazelcastInstance;
 
     // Usar ThreadLocal para evitar vazamentos de memória
     private static final ThreadLocal<Map<String, Object>> threadLocalCache = 
@@ -57,13 +57,13 @@ public class RateLimitUtil {
             }
         });
         
-        // Agendar limpeza de contadores expirados (a cada 1 hora)
+        /*// Agendar limpeza de contadores expirados (a cada 1 hora)
         scheduler.scheduleAtFixedRate(
             this::cleanupExpiredCounters, 
             INITIAL_DELAY, 
             COUNTER_CLEANUP_PERIOD, 
             TimeUnit.HOURS
-        );
+        );*/
         
         // Agendar limpeza do cache de PreparedStatements (a cada 30 minutos)
         scheduler.scheduleAtFixedRate(
@@ -96,13 +96,13 @@ public class RateLimitUtil {
     }
 
 
-    private HazelcastInstance getHazelcastInstance() {
+    /*private HazelcastInstance getHazelcastInstance() {
         hazelcastInstance = Hazelcast.getHazelcastInstanceByName("axway-instance");
         if (hazelcastInstance == null) {
             Trace.error("Não foi possível encontrar a instância do Hazelcast.");
         }
         return hazelcastInstance;
-    }
+    }*/
     
     public boolean performRateLimitValidations(Message msg, String userKeySelectorParam) {
     	return validateRateLimit(msg, userKeySelectorParam);
@@ -122,7 +122,8 @@ public class RateLimitUtil {
     
     // Melhorar o gerenciamento de cache
     private List<Map<String, Object>> getRateLimit(Dictionary msg) {
-        IMap<String, List<Map<String, Object>>> cache = getHazelcastInstance().getMap("rateLimitCache");
+        //IMap<String, List<Map<String, Object>>> cache = getHazelcastInstance().getMap("rateLimitCache");
+        FakeMap<String, List<Map<String, Object>>> cache = FakeHazelcast.getMap("rateLimitCache");
         String cacheKey = "rateLimits:cassandra";
 
         return cache.computeIfAbsent(cacheKey, k -> {
@@ -217,7 +218,7 @@ public class RateLimitUtil {
                     TimeUnit timeUnit = mapStringToTimeUnit(timeUnitStr);
                     
                     String counterName = RATE_LIMITER_PREFIX + selectorValue;
-                    IAtomicLong counter = getOrCreateCounter(counterName);
+                    AtomicLong counter = getOrCreateCounter(counterName);
                     
                     if (counter == null) {
                         // Fallback em caso de erro com CP Subsystem
@@ -226,7 +227,7 @@ public class RateLimitUtil {
                     }
                     
                     // Verifica se o contador existe e está dentro do período válido
-                    IMap<String, Long> expirationMap = hazelcastInstance.getMap(RATE_LIMITER_PREFIX + "expiration");
+                    FakeMap<String, Long> expirationMap = FakeHazelcast.getMap(RATE_LIMITER_PREFIX + "expiration");
                     Long lastResetTime = expirationMap.get(counterName);
                     
                     if (lastResetTime == null || (currentTime - lastResetTime) >= timeUnit.toMillis(timeInterval)) {
@@ -257,7 +258,7 @@ public class RateLimitUtil {
         }
     }
     
-    private void cleanupExpiredCounters() {
+    /*private void cleanupExpiredCounters() {
         IMap<String, Long> expirationMap = getHazelcastInstance().getMap(RATE_LIMITER_PREFIX+"expiration");
         for (Map.Entry<String, Long> entry : expirationMap.entrySet()) {
             if (System.currentTimeMillis() - entry.getValue() >= TimeUnit.HOURS.toMillis(1)) {
@@ -267,7 +268,7 @@ public class RateLimitUtil {
                 expirationMap.delete(entry.getKey());
             }
         }
-    }
+    }*/
 
 
     private String[] isRateLimitApplicable(Message msg, String rateLimitKeyBD, String rateLimitKeySelector,
@@ -308,7 +309,7 @@ public class RateLimitUtil {
             closeCassandraResources();
             
             // Limpar contadores e mapas do Hazelcast
-            HazelcastInstance hz = getHazelcastInstance();
+            /*HazelcastInstance hz = getHazelcastInstance();
             if (hz != null) {
                 try {
                     // Limpar mapa de expiração
@@ -336,7 +337,7 @@ public class RateLimitUtil {
                     Trace.error("Erro ao limpar mapas do Hazelcast", e);
                 }
             }
-            
+            */
             Trace.info("RateLimitUtil destruído com sucesso.");
             
         } catch (Exception e) {
@@ -345,9 +346,10 @@ public class RateLimitUtil {
         }
     }
 
-    private IAtomicLong getOrCreateCounter(String counterName) {
+    private AtomicLong getOrCreateCounter(String counterName) {
         try {
-            return getHazelcastInstance().getCPSubsystem().getAtomicLong(counterName);
+            //return getHazelcastInstance().getCPSubsystem().getAtomicLong(counterName);
+            return FakeAtomicCounter.getCounter(counterName);
         } catch (Exception e) {
             Trace.error("Erro ao obter contador: " + counterName, e);
             return null;

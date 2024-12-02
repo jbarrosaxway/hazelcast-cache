@@ -2,41 +2,15 @@ package com.axway.hazelcast;
 
 import java.io.FileInputStream;
 import java.io.IOException;
-import java.lang.management.ManagementFactory;
-import java.lang.management.MemoryPoolMXBean;
-import java.lang.management.MemoryUsage;
-import java.lang.management.OperatingSystemMXBean;
-import java.util.List;
 import java.util.Properties;
-import java.util.Set;
-import java.util.Timer;
-import java.util.TimerTask;
-import java.util.stream.Collectors;
 
-import com.hazelcast.cluster.Member;
-import com.hazelcast.cluster.MembershipEvent;
-import com.hazelcast.cluster.MembershipListener;
-import com.hazelcast.config.Config;
-import com.hazelcast.config.EvictionConfig;
-import com.hazelcast.config.EvictionPolicy;
-import com.hazelcast.config.InMemoryFormat;
-import com.hazelcast.config.JoinConfig;
-import com.hazelcast.config.KubernetesConfig;
-import com.hazelcast.config.MapConfig;
-import com.hazelcast.config.MaxSizePolicy;
-import com.hazelcast.config.NetworkConfig;
-import com.hazelcast.config.SSLConfig;
-import com.hazelcast.config.TcpIpConfig;
-import com.hazelcast.core.Hazelcast;
-import com.hazelcast.core.HazelcastInstance;
-import com.hazelcast.map.IMap;
 import com.vordel.config.ConfigContext;
 import com.vordel.config.LoadableModule;
 import com.vordel.es.EntityStoreException;
 import com.vordel.trace.Trace;
 
 public class HazelcastCacheManager implements LoadableModule {
-    private volatile HazelcastInstance hazelcastInstance;
+    //private volatile HazelcastInstance hazelcastInstance;
     private static final String DEFAULT_INSTANCE_NAME = "axway-instance";
     private static final String DEFAULT_PORT = "5701";
     
@@ -71,7 +45,7 @@ public class HazelcastCacheManager implements LoadableModule {
     public void load(LoadableModule parent, String typeName) {
         try {
             String propFilePath = "conf/envSettings.props";
-            Properties props = loadProperties(propFilePath);
+            Properties props = loadProperties(propFilePath); 
             
             if (props == null) {
                 throw new IllegalStateException("Não foi possível carregar as propriedades do arquivo: " + propFilePath);
@@ -80,14 +54,14 @@ public class HazelcastCacheManager implements LoadableModule {
             String instanceName = props.getProperty("env.HAZELCAST.instanceName", DEFAULT_INSTANCE_NAME);
             String port = props.getProperty("env.HAZELCAST.port", DEFAULT_PORT);
             
-            shutdownExistingInstance(instanceName);
+            //shutdownExistingInstance(instanceName);
     
-            Config config = createOptimizedConfig(props, port, instanceName);
+            //Config config = createOptimizedConfig(props, port, instanceName);
             
-            hazelcastInstance = Hazelcast.newHazelcastInstance(config);
-            addClusterMembershipListener(hazelcastInstance);
-            monitorClusterMembers(hazelcastInstance);
-            schedulePeriodicCleanup(); // Adicionar limpeza periódica 
+            //hazelcastInstance = Hazelcast.newHazelcastInstance(config);
+            //addClusterMembershipListener(hazelcastInstance);
+            //monitorClusterMembers(hazelcastInstance);
+            //schedulePeriodicCleanup(); // Adicionar limpeza periódica 
             
             Trace.info("Hazelcast Instance iniciado com configurações otimizadas.");
             
@@ -97,7 +71,7 @@ public class HazelcastCacheManager implements LoadableModule {
         }
     }
 
-    private void addClusterMembershipListener(HazelcastInstance hazelcastInstance) {
+    /*private void addClusterMembershipListener(HazelcastInstance hazelcastInstance) {
         if (hazelcastInstance != null) {
             hazelcastInstance.getCluster().addMembershipListener(
                 new ClusterMembershipListener(hazelcastInstance)
@@ -118,31 +92,31 @@ public class HazelcastCacheManager implements LoadableModule {
                 existingInstance = null;
             }
         }
-    }
-
+    }*/
+    /*
     private Config createOptimizedConfig(Properties props, String port, String instanceName) {
         Config config = new Config();
         config.setInstanceName(instanceName);
-        configureSystemResources(config, props);
+        //configureSystemResources(config, props);
 
         // Configurações originais
-        configureCPSubsystem(config, props);
-        configureBasicSettings(config, port);
-        configureDiagnostics(config, props);
-        configureLoggingAndMapSettings(config, props);
-        configureNetworkSettings(config, props);
-        configurePerformanceSettings(config, props);
-        configureTimeoutSettings(config, props);
-        configureDiscovery(config, props);
+        //configureCPSubsystem(config, props);
+        //configureBasicSettings(config, port);
+        //configureDiagnostics(config, props);
+        //configureLoggingAndMapSettings(config, props);
+        //configureNetworkSettings(config, props);
+        //configurePerformanceSettings(config, props);
+        //configureTimeoutSettings(config, props);
+        //configureDiscovery(config, props);
 
         // Otimizações adicionais
-        configureMemoryOptimizations(config, props);
-        configureNetworkOptimizations(config, props);
-        configureOperationOptimizations(config, props);
+        //configureMemoryOptimizations(config, props);
+        //configureNetworkOptimizations(config, props);
+        //configureOperationOptimizations(config, props);
         
         return config;
-    }
-
+    }*/
+    /*
     private void configureMemoryOptimizations(Config config, Properties props) {
         // Configurações de memória mais agressivas
         config.setProperty("hazelcast.memory.free.min.percentage", 
@@ -248,10 +222,10 @@ public class HazelcastCacheManager implements LoadableModule {
         config.setProperty("hazelcast.operation.response.thread.count", 
             String.valueOf(DEFAULT_OPERATION_THREAD_COUNT));
     }
-
+	*/
 
         // Classe interna para o MembershipListener
-    private class ClusterMembershipListener implements MembershipListener {
+    /*private class ClusterMembershipListener implements MembershipListener {
         private final HazelcastInstance hazelcastInstance;
 
         public ClusterMembershipListener(HazelcastInstance hazelcastInstance) {
@@ -269,19 +243,20 @@ public class HazelcastCacheManager implements LoadableModule {
             Trace.info("Membro removido do cluster: " + membershipEvent.getMember().getAddress());
             monitorClusterMembers(hazelcastInstance);
         }
-    }
+    }*/
 
 
     @Override
     public void unload() {
         try {
-            if (hazelcastInstance != null) {
+            /*if (hazelcastInstance != null) {
                 // Forçar limpeza antes do shutdown
                 forceCleanupResources();
                 
                 // Shutdown normal
-                hazelcastInstance.shutdown();
-                
+                //hazelcastInstance.shutdown();
+                FakeHazelcast.shutdown();
+
                 // Esperar pelo shutdown
                 long startTime = System.currentTimeMillis();
                 while (hazelcastInstance.getLifecycleService().isRunning() && 
@@ -297,15 +272,15 @@ public class HazelcastCacheManager implements LoadableModule {
                 
                 // Verificar recursos após shutdown
                 monitorSystemResources();
-            }
+            }*/
         } catch (Exception e) {
             Trace.error("Erro durante unload do HazelcastCacheManager", e);
         } finally {
-            hazelcastInstance = null;
+            //hazelcastInstance = null;
         }
     }
 
-
+    /*
     // Mantendo os métodos originais de configuração com as funcionalidades existentes
     private void configureDiagnostics(Config config, Properties props) {
         config.setProperty("hazelcast.diagnostics.enabled", 
@@ -327,8 +302,8 @@ public class HazelcastCacheManager implements LoadableModule {
         config.setProperty("hazelcast.diagnostics.filename.prefix", 
             props.getProperty("env.HAZELCAST.diagnostics.filename.prefix", "diagnostics"));
     }
-
-    private void configureLoggingAndMapSettings(Config config, Properties props) {
+	*/
+    /*private void configureLoggingAndMapSettings(Config config, Properties props) {
         // Configurações de logging
         config.setProperty("hazelcast.logging.level", 
             props.getProperty("env.HAZELCAST.logging.level", "INFO"));
@@ -377,9 +352,9 @@ public class HazelcastCacheManager implements LoadableModule {
         config.setProperty("hazelcast.internal.map.expiration.task.period.seconds", 
             props.getProperty("env.HAZELCAST.map.expiration.task.period.seconds", "10"));
     }
+*/
 
-
-    private void logDetailedMemoryStatus() {
+    /*private void logDetailedMemoryStatus() {
         try {
             List<MemoryPoolMXBean> memoryPoolMXBeans = ManagementFactory.getMemoryPoolMXBeans();
             for (MemoryPoolMXBean memoryPool : memoryPoolMXBeans) {
@@ -394,9 +369,9 @@ public class HazelcastCacheManager implements LoadableModule {
         } catch (Exception e) {
             Trace.error("Erro ao obter status detalhado da memória", e);
         }
-    }
+    }*/
 
-    private static void configureDiscovery(Config config, Properties props) {
+    /*private static void configureDiscovery(Config config, Properties props) {
         Trace.info("Configurando descoberta de membros...");
         NetworkConfig networkConfig = config.getNetworkConfig();
         JoinConfig joinConfig = networkConfig.getJoin();
@@ -410,8 +385,8 @@ public class HazelcastCacheManager implements LoadableModule {
         } else {
             configureKubernetesDiscovery(joinConfig, props);
         }
-    }
-
+    }*/
+    /*
     private void configureSystemResources(Config config, Properties props) {
         // Configurações anteriores
         config.setProperty("hazelcast.operation.thread.count", 
@@ -432,7 +407,8 @@ public class HazelcastCacheManager implements LoadableModule {
         config.setProperty("hazelcast.client.cleanup.timeout.millis", "30000");
         config.setProperty("hazelcast.socket.buffer.direct", "false");
     }
-    
+    */
+    /*
     private void monitorSystemResources() {
         try {
             // Usar MXBean para obter informações do sistema operacional
@@ -455,16 +431,16 @@ public class HazelcastCacheManager implements LoadableModule {
         } catch (Exception e) {
             Trace.error("Erro ao monitorar recursos do sistema", e);
         }
-    }
+    }*/
     
-    private com.sun.management.UnixOperatingSystemMXBean getUnixOperatingSystemMXBean() {
+    /*private com.sun.management.UnixOperatingSystemMXBean getUnixOperatingSystemMXBean() {
         OperatingSystemMXBean osBean = ManagementFactory.getOperatingSystemMXBean();
         if (osBean instanceof com.sun.management.UnixOperatingSystemMXBean) {
             return (com.sun.management.UnixOperatingSystemMXBean) osBean;
         }
         return null;
-    }
-
+    }*/
+    /*
     private void forceCleanupResources() {
         if (hazelcastInstance != null) {
             try {
@@ -478,9 +454,9 @@ public class HazelcastCacheManager implements LoadableModule {
                 Trace.error("Erro durante limpeza forçada de recursos", e);
             }
         }
-    }
+    }*/
 
-    private static void configureTcpIpDiscovery(JoinConfig joinConfig, String ipList) {
+    /*private static void configureTcpIpDiscovery(JoinConfig joinConfig, String ipList) {
         Trace.info("Configurando descoberta de membros via TCP/IP...");
         TcpIpConfig tcpIpConfig = joinConfig.getTcpIpConfig();
         tcpIpConfig.setEnabled(true);
@@ -515,9 +491,11 @@ public class HazelcastCacheManager implements LoadableModule {
 
     // Método para verificar a saúde da instância
     public boolean isHealthy() {
-        return hazelcastInstance != null && 
-               hazelcastInstance.getLifecycleService().isRunning() &&
-               !hazelcastInstance.getCluster().getMembers().isEmpty();
+        //return hazelcastInstance != null && 
+        //       hazelcastInstance.getLifecycleService().isRunning() &&
+        //       !hazelcastInstance.getCluster().getMembers().isEmpty();
+        return FakeHazelcast.isRunning();
+
     }
 
     // Getter thread-safe para a instância
@@ -628,8 +606,10 @@ public class HazelcastCacheManager implements LoadableModule {
                 Trace.info("  - " + member.getAddress() + " (local: " + member.localMember() + ")");
             }
         }
-    }
+        
 
+    }
+	
     private void configurePerformanceSettings(Config config, Properties props) {
         // Configurações de thread
         config.setProperty("hazelcast.operation.thread.count", 
@@ -690,4 +670,5 @@ public class HazelcastCacheManager implements LoadableModule {
         config.setProperty("hazelcast.migration.min.delay.on.member.removed.seconds", 
             props.getProperty("env.HAZELCAST.migration.min.delay.seconds", "5"));
     }
+    */
 }

@@ -1,19 +1,16 @@
 package com.axway.hazelcast.fake;
 
+import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.atomic.AtomicLong;
 
 public class FakeAtomicCounter {
-    private static final AtomicLong counter = new AtomicLong(0);
+    private static final ConcurrentHashMap<String, AtomicLong> counters = new ConcurrentHashMap<>();
     
-    public static long incrementAndGet() {
-        return counter.incrementAndGet();
+    public static AtomicLong getCounter(String name) {
+        return counters.computeIfAbsent(name, k -> new AtomicLong(0));
     }
     
-    public static long get() {
-        return counter.get();
-    }
-    
-    public static void set(long value) {
-        counter.set(value);
+    public static void clear() {
+        counters.clear();
     }
 }
