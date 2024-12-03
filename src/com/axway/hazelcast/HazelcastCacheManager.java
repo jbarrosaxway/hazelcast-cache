@@ -24,12 +24,15 @@ import com.hazelcast.config.JoinConfig;
 import com.hazelcast.config.KubernetesConfig;
 import com.hazelcast.config.MapConfig;
 import com.hazelcast.config.MaxSizePolicy;
+import com.hazelcast.config.MetricsConfig;
 import com.hazelcast.config.NetworkConfig;
 import com.hazelcast.config.SSLConfig;
 import com.hazelcast.config.TcpIpConfig;
 import com.hazelcast.core.Hazelcast;
 import com.hazelcast.core.HazelcastInstance;
 import com.hazelcast.map.IMap;
+import com.hazelcast.memory.MemorySize;
+import com.hazelcast.memory.MemoryUnit;
 import com.vordel.config.ConfigContext;
 import com.vordel.config.LoadableModule;
 import com.vordel.es.EntityStoreException;
@@ -104,6 +107,103 @@ public class HazelcastCacheManager implements LoadableModule {
             );
         }
     }
+    
+    private void configureMemoryLimits(Config config, Properties props) {
+        // Configuração de limites de heap
+        config.setProperty("hazelcast.memory.free.min.percentage", 
+            props.getProperty("env.HAZELCAST.memory.free.min.percentage", "20"));
+        config.setProperty("hazelcast.memory.free.max.percentage", 
+            props.getProperty("env.HAZELCAST.memory.free.max.percentage", "30"));
+        
+        // Configuração de heap máximo
+        int maxHeapMB = Integer.parseInt(
+            props.getProperty("env.HAZELCAST.max.heap.mb", "4096")); // 4GB default
+        config.setProperty("hazelcast.max.heap.size.mb", String.valueOf(maxHeapMB));
+
+        // Configuração de native memory
+        config.getNativeMemoryConfig()
+            .setEnabled(true)
+            .setSize(new MemorySize(maxHeapMB, MemoryUnit.MEGABYTES))
+            .setMinBlockSize(16)
+            .setPageSize(1 << 20) // 1MB
+            .setMetadataSpacePercentage(40);
+
+        // Configurações adicionais de memória
+        config.setProperty("hazelcast.elastic.memory.enabled", "true");
+        config.setProperty("hazelcast.elastic.memory.total.size.mb", String.valueOf(maxHeapMB));
+        config.setProperty("hazelcast.memory.leak.detector.enabled", "true");
+        
+        // Configuração de GC
+        config.setProperty("hazelcast.gc.check.period.seconds", "30");
+        config.setProperty("hazelcast.gc.threshold.warning", "70");
+        config.setProperty("hazelcast.gc.threshold.error", "90");
+    }
+
+    private void configureConnectionLimits(Config config, Properties props) {
+        NetworkConfig networkConfig = config.getNetworkConfig();
+        
+        // Configurações de conexão
+        config.setProperty("hazelcast.connection.monitor.interval", 
+            props.getProperty("env.HAZELCAST.connection.monitor.interval", "5"));
+        config.setProperty("hazelcast.connection.monitor.max.faults", 
+            props.getProperty("env.HAZELCAST.connection.monitor.max.faults", "3"));
+        
+        // Configurações de socket e porta
+        networkConfig.setPort(Integer.parseInt(
+            props.getProperty("env.HAZELCAST.port", "5701")))
+            .setPortAutoIncrement(true)
+            .setPortCount(100);
+        
+        // Configurações de timeout e conexão
+        config.setProperty("hazelcast.socket.connect.timeout.seconds", 
+            props.getProperty("env.HAZELCAST.socket.connect.timeout", "5"));
+        config.setProperty("hazelcast.socket.keep.alive", "true");
+        
+        // Configurações de pool de conexões
+        config.setProperty("hazelcast.client.max.connection.attempts", 
+            props.getProperty("env.HAZELCAST.client.max.connection.attempts", "3"));
+        config.setProperty("hazelcast.connection.max.count", 
+            props.getProperty("env.HAZELCAST.connection.max.count", "100"));
+        
+        // Configurações de heartbeat e timeout
+        config.setProperty("hazelcast.client.heartbeat.timeout", 
+            props.getProperty("env.HAZELCAST.client.heartbeat.timeout", "60000"));
+        config.setProperty("hazelcast.client.heartbeat.interval", 
+            props.getProperty("env.HAZELCAST.client.heartbeat.interval", "5000"));
+        
+        // Configurações de buffer de rede
+        config.setProperty("hazelcast.socket.receive.buffer.size", 
+            props.getProperty("env.HAZELCAST.socket.receive.buffer.size", "32"));
+        config.setProperty("hazelcast.socket.send.buffer.size", 
+            props.getProperty("env.HAZELCAST.socket.send.buffer.size", "32"));
+        
+        // Configurações de backlog
+        config.setProperty("hazelcast.socket.server.backlog", 
+            props.getProperty("env.HAZELCAST.socket.server.backlog", "100"));
+        
+        // Configurações de timeout de operações
+        config.setProperty("hazelcast.operation.call.timeout.millis", 
+            props.getProperty("env.HAZELCAST.operation.call.timeout.millis", "60000"));
+    }
+
+
+
+    private void configureOperationLimits(Config config, Properties props) {
+        // Limite de operações concorrentes
+        config.setProperty("hazelcast.operation.thread.count", 
+            props.getProperty("env.HAZELCAST.operation.thread.count", 
+                String.valueOf(Runtime.getRuntime().availableProcessors())));
+                
+        config.setProperty("hazelcast.operation.generic.thread.count", 
+            props.getProperty("env.HAZELCAST.operation.generic.thread.count", 
+                String.valueOf(Runtime.getRuntime().availableProcessors())));
+                
+        // Limite de operações por segundo
+        config.setProperty("hazelcast.operation.call.timeout.millis", "60000");
+        config.setProperty("hazelcast.operation.backup.timeout.millis", "5000");
+    }
+
+    
     private void shutdownExistingInstance(String instanceName) {
         HazelcastInstance existingInstance = Hazelcast.getHazelcastInstanceByName(instanceName);
         if (existingInstance != null) {
@@ -134,6 +234,10 @@ public class HazelcastCacheManager implements LoadableModule {
         configurePerformanceSettings(config, props);
         configureTimeoutSettings(config, props);
         configureDiscovery(config, props);
+        configureMemoryLimits(config, props);
+        configureConnectionLimits(config, props);
+        configureOperationLimits(config, props);
+        configureMetrics(config, props);
 
         // Otimizações adicionais
         configureMemoryOptimizations(config, props);
@@ -142,6 +246,33 @@ public class HazelcastCacheManager implements LoadableModule {
         
         return config;
     }
+    
+    private void configureMetrics(Config config, Properties props) {
+        // Configuração básica de métricas
+        MetricsConfig metricsConfig = new MetricsConfig()
+            .setEnabled(true)
+            .setCollectionFrequencySeconds(
+                Integer.parseInt(props.getProperty("env.HAZELCAST.metrics.collection.frequency", "5")));
+        
+        // Configuração específica para Management Center
+        metricsConfig.getManagementCenterConfig()
+            .setEnabled(true)
+            .setRetentionSeconds(
+                Integer.parseInt(props.getProperty("env.HAZELCAST.metrics.retention.seconds", "5")));
+        
+        // Configuração de JMX (opcional)
+        metricsConfig.getJmxConfig()
+            .setEnabled(true);
+        
+        config.setMetricsConfig(metricsConfig);
+        
+        // Propriedades adicionais de métricas
+        config.setProperty("hazelcast.metrics.enabled", "true");
+        config.setProperty("hazelcast.metrics.mc.enabled", "true");
+        config.setProperty("hazelcast.metrics.collection.frequency", 
+            props.getProperty("env.HAZELCAST.metrics.collection.frequency", "5"));
+    }
+
 
     private void configureMemoryOptimizations(Config config, Properties props) {
         // Configurações de memória mais agressivas
