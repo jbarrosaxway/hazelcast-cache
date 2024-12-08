@@ -11,7 +11,6 @@ import java.util.Properties;
 import java.util.Set;
 import java.util.Timer;
 import java.util.TimerTask;
-import java.util.stream.Collectors;
 
 import com.hazelcast.client.HazelcastClient;
 import com.hazelcast.client.config.ClientConfig;
@@ -33,7 +32,6 @@ import com.hazelcast.config.SSLConfig;
 import com.hazelcast.config.TcpIpConfig;
 import com.hazelcast.core.Hazelcast;
 import com.hazelcast.core.HazelcastInstance;
-import com.hazelcast.map.IMap;
 import com.hazelcast.memory.MemorySize;
 import com.hazelcast.memory.MemoryUnit;
 import com.vordel.config.ConfigContext;
@@ -60,6 +58,21 @@ public class HazelcastCacheManager implements LoadableModule {
 
     @Override
     public void configure(ConfigContext ctx, com.vordel.es.Entity entity) throws EntityStoreException {
+    }
+    
+
+    private void configureBasicSettings(Config config, Properties props) {
+    	config.getNetworkConfig().setPort(Integer.parseInt(props.getProperty("env.HAZELCAST.port", DEFAULT_PORT)));
+
+        // Configurações básicas adicionais
+        config.setProperty("hazelcast.partition.count", "271");
+        config.setProperty("hazelcast.logging.type", "slf4j");
+        config.setProperty("hazelcast.phone.home.enabled", "false");
+        config.setProperty("hazelcast.jmx", "false");
+        
+        // Adicionar configuração do tipo de rate limit
+        String rateLimitType = props.getProperty("env.HAZELCAST.ratelimit.type", "atomic");
+        config.setProperty("hazelcast.ratelimit.type", rateLimitType);
     }
 
     private Properties loadProperties(String filePath) {
@@ -216,7 +229,7 @@ public class HazelcastCacheManager implements LoadableModule {
         
         // Configurações de socket e porta
         networkConfig.setPort(Integer.parseInt(
-            props.getProperty("env.HAZELCAST.port", "5701")))
+            props.getProperty("env.HAZELCAST.port", DEFAULT_PORT)))
             .setPortAutoIncrement(true)
             .setPortCount(100);
         
@@ -293,7 +306,7 @@ public class HazelcastCacheManager implements LoadableModule {
 
         // Configurações originais
         configureCPSubsystem(config, props);
-        configureBasicSettings(config, port);
+        configureBasicSettings(config, props);
         configureDiagnostics(config, props);
         configureLoggingAndMapSettings(config, props);
         configureNetworkSettings(config, props);
@@ -388,23 +401,7 @@ public class HazelcastCacheManager implements LoadableModule {
             }, 30000, 60000); // Executar a cada 1 minuto, começando após 30 segundos
         }
     }
-    
-    private void forceMapCleanup() {
-        if (hazelcastInstance != null) {
-            for (String mapName : hazelcastInstance.getDistributedObjects()
-                    .stream()
-                    .filter(obj -> obj instanceof IMap)
-                    .map(obj -> obj.getName())
-                    .collect(Collectors.toList())) {
-                
-                IMap<?, ?> map = hazelcastInstance.getMap(mapName);
-                if (map != null) {
-                    map.evictAll();
-                    Trace.info("Forçada limpeza do map: " + mapName);
-                }
-            }
-        }
-    }
+
 
     private void configureNetworkOptimizations(Config config, Properties props) {
         // Usando DEFAULT_SOCKET_BUFFER_SIZE
@@ -570,9 +567,9 @@ public class HazelcastCacheManager implements LoadableModule {
         config.setProperty("hazelcast.map.eviction.cleanup.operation.count", 
             props.getProperty("env.HAZELCAST.map.eviction.cleanup.operation.count", "100"));
         config.setProperty("hazelcast.internal.map.expiration.cleanup.percentage", 
-            props.getProperty("env.HAZELCAST.map.expiration.cleanup.percentage", "30"));
+            props.getProperty("env.HAZELCAST.map.expiration.cleanup.percentage", "100"));
         config.setProperty("hazelcast.internal.map.expiration.task.period.seconds", 
-            props.getProperty("env.HAZELCAST.map.expiration.task.period.seconds", "10"));
+            props.getProperty("env.HAZELCAST.map.expiration.task.period.seconds", "1"));
     }
 
 
@@ -698,7 +695,7 @@ public class HazelcastCacheManager implements LoadableModule {
         // Configurações do Kubernetes com valores padrão otimizados
         String namespace = props.getProperty("env.HAZELCAST.namespace", "axway");
         String serviceName = props.getProperty("env.HAZELCAST.serviceName", "traffic");
-        String servicePort = props.getProperty("env.HAZELCAST.servicePort", "5701");
+        String servicePort = props.getProperty("env.HAZELCAST.servicePort", DEFAULT_PORT);
         
         kubernetesConfig.setProperty("namespace", namespace);
         kubernetesConfig.setProperty("service-name", serviceName);
@@ -731,16 +728,6 @@ public class HazelcastCacheManager implements LoadableModule {
             .setSessionHeartbeatIntervalSeconds(Integer.parseInt(props.getProperty("env.HAZELCAST.cp.session.heartbeat.interval.seconds", "5")));
     
         Trace.info("CP Subsystem configurado com configuração padrão");
-    }
-    
-    private void configureBasicSettings(Config config, String port) {
-        config.getNetworkConfig().setPort(Integer.parseInt(port));
-        
-        // Configurações básicas adicionais
-        config.setProperty("hazelcast.partition.count", "271"); // Número primo para melhor distribuição
-        config.setProperty("hazelcast.logging.type", "slf4j");
-        config.setProperty("hazelcast.phone.home.enabled", "false");
-        config.setProperty("hazelcast.jmx", "false");
     }
     
     private void configureNetworkSettings(Config config, Properties props) {
@@ -798,7 +785,7 @@ public class HazelcastCacheManager implements LoadableModule {
                 
                 String namespace = props.getProperty("env.HAZELCAST.namespace", "axway");
                 String serviceName = props.getProperty("env.HAZELCAST.serviceName", "traffic");
-                String servicePort = props.getProperty("env.HAZELCAST.servicePort", "5701");
+                String servicePort = props.getProperty("env.HAZELCAST.servicePort", DEFAULT_PORT);
                 
                 kubernetesConfig.setProperty("namespace", namespace);
                 kubernetesConfig.setProperty("service-name", serviceName);

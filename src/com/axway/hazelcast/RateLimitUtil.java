@@ -28,6 +28,10 @@ import com.vordel.el.Selector;
 import com.vordel.trace.Trace;
 
 public class RateLimitUtil {
+    private static final String RATE_LIMIT_TYPE_PROPERTY = "env.HAZELCAST.ratelimit.type";
+    private static final String RATE_LIMIT_TYPE_ATOMIC = "atomic";
+    private static final String RATE_LIMIT_TYPE_MAP = "map";
+    public String rateLimitType = "atomic";
     private static volatile RateLimitUtil instance = null;
     private final ScheduledExecutorService scheduler;
     private volatile HazelcastInstance hazelcastInstance;
@@ -199,8 +203,16 @@ public class RateLimitUtil {
     }
 
 
+    public boolean validateRateLimit(Message msg, String userKeySelectorParam) {        
+        if (RATE_LIMIT_TYPE_MAP.equalsIgnoreCase(rateLimitType)) {
+            return validateRateLimitUsingMap(msg, userKeySelectorParam);
+        } else {
+            return validateRateLimitUsingAtomic(msg, userKeySelectorParam);
+        }
+    }
 
-    public boolean validateRateLimit(Message msg, String userKeySelectorParam) {
+
+    public boolean validateRateLimitUsingAtomic(Message msg, String userKeySelectorParam) {
         List<Map<String, Object>> rateLimits = getRateLimit(msg);
         Trace.debug("Rate limits: " + rateLimits.toString());
         long currentTime = System.currentTimeMillis();
@@ -264,6 +276,62 @@ public class RateLimitUtil {
             }
             return true;
         }
+    }
+    
+
+    private boolean validateRateLimitUsingMap(Message msg, String userKeySelectorParam) {
+        List<Map<String, Object>> rateLimits = getRateLimit(msg);
+        String mapName;
+        Trace.debug("Rate limits: " + rateLimits.toString());
+        long currentTime = System.currentTimeMillis();
+        
+        if (rateLimits.isEmpty()) {
+            return true;
+        } else {
+            for (Map<String, Object> rateLimit : rateLimits) {
+                boolean isValid = true;
+                String rateLimitKeyBD = (String) rateLimit.get("rateLimitkey");
+                String rateLimitKeySelector = (String) rateLimit.get("rateLimitkeySelector");
+                
+                Selector<String> keySelector = new Selector<>(rateLimitKeySelector, String.class);
+                Selector<String> key = new Selector<>(rateLimitKeyBD, String.class);
+                Selector<String> userKeySelector = new Selector<>(userKeySelectorParam, String.class);
+                
+                String selectorValue = keySelector.substitute(msg);
+                String selectorKey = key.substitute(msg);
+                String userKey = userKeySelector.substitute(msg);
+                
+                if (selectorKey.equals(selectorValue) && selectorKey.equals(userKey)) {
+                    Number rateLimitValue = Long.parseLong((String)rateLimit.get("rateLimit"));
+                    Integer timeInterval = Integer.parseInt((String)rateLimit.get("timeInterval"));
+                    String timeUnitStr = (String) rateLimit.get("timeUnit");
+                    TimeUnit timeUnit = mapStringToTimeUnit(timeUnitStr);
+                    
+                    mapName = selectorValue;
+                    IMap<String, Long> map = hazelcastInstance.getMap(mapName);
+                    
+                    int rate = validateRateLimitWithTTL(map);
+                    rate += 1;
+                    
+                    if (rate > rateLimitValue.intValue()) {
+                        isValid = false;
+                    } else {
+                        String identificadorReq = ""+msg.correlationId+"";
+                        map.put(identificadorReq, currentTime, timeInterval, timeUnit);
+                    }
+                    
+                    msg.put("rate-limit."+mapName+".is-exceeded", !isValid);
+                    int remain = rateLimitValue.intValue() - rate;
+                    msg.put("rate-limit."+mapName+".remain", !isValid?0:remain);
+                    return isValid;
+                }
+            }
+            return true;
+        }
+    }
+
+    private int validateRateLimitWithTTL(IMap<String, Long> map) {
+        return map.size();
     }
     
     private void cleanupExpiredCounters() {
