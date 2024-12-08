@@ -28,7 +28,7 @@ import com.vordel.el.Selector;
 import com.vordel.trace.Trace;
 
 public class RateLimitUtil {
-    private static volatile RateLimitUtil instance = new RateLimitUtil();
+    private static volatile RateLimitUtil instance = null;
     private final ScheduledExecutorService scheduler;
     private volatile HazelcastInstance hazelcastInstance;
 
@@ -45,6 +45,8 @@ public class RateLimitUtil {
     
     // Cache para PreparedStatements
     private final Map<String, PreparedStatement> preparedStatementCache = new ConcurrentHashMap<>();
+
+
     
     private RateLimitUtil() {
         scheduler = Executors.newScheduledThreadPool(2, new ThreadFactory() {
@@ -83,12 +85,19 @@ public class RateLimitUtil {
         }));
     }
     
+    
+    private RateLimitUtil(HazelcastInstance hazelcastInstance) {
+        this.hazelcastInstance = hazelcastInstance;
+		this.scheduler = null;
+        
+        Trace.info("RateLimitUtil iniciado com instância Hazelcast fornecida");
+    }
 
-    public static RateLimitUtil getInstance() {
+    public static RateLimitUtil getInstance(HazelcastInstance hazelcastInstance) {
         if (instance == null) {
             synchronized (RateLimitUtil.class) {
                 if (instance == null) {
-                    instance = new RateLimitUtil();
+                    instance = new RateLimitUtil(hazelcastInstance);
                 }
             }
         }
@@ -97,7 +106,7 @@ public class RateLimitUtil {
 
 
     private HazelcastInstance getHazelcastInstance() {
-        hazelcastInstance = Hazelcast.getHazelcastInstanceByName("axway-instance");
+        // Não precisamos mais procurar a instância, pois ela já foi injetada
         if (hazelcastInstance == null) {
             Trace.error("Não foi possível encontrar a instância do Hazelcast.");
         }

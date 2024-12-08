@@ -1,0 +1,10 @@
+spec:
+  template:
+    spec:
+      initContainers:
+      - name: init-mc
+        image: busybox
+        command: ['sh', '-c', 'rm -f /data/mc.lock']
+        volumeMounts:
+        - name: mancenter-storage
+          mountPath: /data

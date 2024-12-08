@@ -1,0 +1,7 @@
+hazelcast-client:
+  cluster-name: "axway-cluster"  # Define o nome do cluster aqui
+  network:
+    kubernetes:
+      enabled: true
+      namespace: axway
+      service-name: apim20230830-gateway-apitraffic

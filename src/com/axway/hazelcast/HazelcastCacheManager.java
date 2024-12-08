@@ -13,6 +13,9 @@ import java.util.Timer;
 import java.util.TimerTask;
 import java.util.stream.Collectors;
 
+import com.hazelcast.client.HazelcastClient;
+import com.hazelcast.client.config.ClientConfig;
+import com.hazelcast.client.config.ClientNetworkConfig;
 import com.hazelcast.cluster.Member;
 import com.hazelcast.cluster.MembershipEvent;
 import com.hazelcast.cluster.MembershipListener;
@@ -73,6 +76,7 @@ public class HazelcastCacheManager implements LoadableModule {
     @Override
     public void load(LoadableModule parent, String typeName) {
         try {
+        	System.setProperty("hazelcast.ignoreXxeProtectionFailures", "true");
             String propFilePath = "conf/envSettings.props";
             Properties props = loadProperties(propFilePath);
             
@@ -80,19 +84,22 @@ public class HazelcastCacheManager implements LoadableModule {
                 throw new IllegalStateException("Não foi possível carregar as propriedades do arquivo: " + propFilePath);
             }
             
-            String instanceName = props.getProperty("env.HAZELCAST.instanceName", DEFAULT_INSTANCE_NAME);
-            String port = props.getProperty("env.HAZELCAST.port", DEFAULT_PORT);
+            // Novo parâmetro para determinar o modo de operação
+            boolean isClientMode = Boolean.parseBoolean(
+                props.getProperty("env.HAZELCAST.client.mode.enabled", "false")
+            );
             
-            shutdownExistingInstance(instanceName);
-    
-            Config config = createOptimizedConfig(props, port, instanceName);
             
-            hazelcastInstance = Hazelcast.newHazelcastInstance(config);
+            if (isClientMode) {
+                initializeClientMode(props);
+            } else {
+                initializeServerMode(props);
+            }
+            // Inicializa o RateLimitUtil com a instância correta
+            RateLimitUtil.getInstance(hazelcastInstance);
             addClusterMembershipListener(hazelcastInstance);
             monitorClusterMembers(hazelcastInstance);
-            schedulePeriodicCleanup(); // Adicionar limpeza periódica 
-            
-            Trace.info("Hazelcast Instance iniciado com configurações otimizadas.");
+            schedulePeriodicCleanup();
             
         } catch (Exception e) {
             Trace.error("Erro ao inicializar Hazelcast", e);
@@ -106,6 +113,65 @@ public class HazelcastCacheManager implements LoadableModule {
                 new ClusterMembershipListener(hazelcastInstance)
             );
         }
+    }
+
+    private void initializeClientMode(Properties props) {
+        Trace.info("Iniciando Hazelcast em modo cliente...");
+        ClientConfig clientConfig = new ClientConfig();
+        
+        // Configurações básicas do cliente
+        clientConfig.setClusterName(
+            props.getProperty("env.HAZELCAST.cluster.name", "axway-cluster")
+        );
+
+        // Configurar descoberta
+        String ipList = props.getProperty("env.HAZELCAST.member.ips");
+        if (ipList != null && !ipList.isEmpty()) {
+            // Usar TCP/IP
+            for (String address : ipList.split(",")) {
+                clientConfig.getNetworkConfig().addAddress(address.trim());
+            }
+        } else {
+            // Usar descoberta Kubernetes
+            ClientNetworkConfig networkConfig = clientConfig.getNetworkConfig();
+            networkConfig.getKubernetesConfig()
+                .setEnabled(true)
+                .setProperty("namespace", props.getProperty("env.HAZELCAST.namespace", "default"))
+                .setProperty("service-name", props.getProperty("env.HAZELCAST.serviceName", "hazelcast"))
+                .setProperty("resolve-not-ready-addresses", "false");
+        }
+        
+        hazelcastInstance = HazelcastClient.newHazelcastClient(clientConfig);
+        Trace.info("Hazelcast cliente iniciado com sucesso");
+    }
+
+    private void initializeServerMode(Properties props) {
+        Trace.info("Iniciando Hazelcast em modo servidor...");
+        Config config = createOptimizedConfig(props, 
+            props.getProperty("env.HAZELCAST.port", DEFAULT_PORT), 
+            props.getProperty("env.HAZELCAST.instanceName", DEFAULT_INSTANCE_NAME)
+        );
+        
+        // Configurações básicas do cliente
+        config.setClusterName(
+            props.getProperty("env.HAZELCAST.cluster.name", "axway-cluster")
+        );
+
+        config.setProperty("hazelcast.ignoreXxeProtectionFailures", "true");
+        
+        // Configurar descoberta usando o método existente
+        NetworkConfig networkConfig = config.getNetworkConfig();
+        JoinConfig joinConfig = networkConfig.getJoin();
+        
+        String ipList = props.getProperty("env.HAZELCAST.member.ips");
+        if (ipList != null && !ipList.isEmpty()) {
+            configureTcpIpDiscovery(joinConfig, ipList);
+        } else {
+            configureKubernetesDiscovery(joinConfig, props);
+        }
+
+        hazelcastInstance = Hazelcast.newHazelcastInstance(config);
+        Trace.info("Hazelcast servidor iniciado com sucesso");
     }
     
     private void configureMemoryLimits(Config config, Properties props) {

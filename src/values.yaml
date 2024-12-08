@@ -1,0 +1,171 @@
+# Configuração básica do cluster
+cluster:
+  memberCount: 2
+  cluster-name: "axway-cluster"  # Nome do cluster adicionado aqui
+  
+image:
+  tag: "5.3.8"  # Versão específica do IMDG
+  repository: "hazelcast/hazelcast"
+  
+# Configurações do Hazelcast
+hazelcast:
+  yaml:
+    hazelcast:
+      cluster-name: "axway-cluster"
+      network:
+        join:
+          kubernetes:
+            enabled: true
+            service-name: "${serviceName}"
+            namespace: "${namespace}"
+            kubernetes-master: "https://kubernetes.default.svc"
+        port:
+          auto-increment: true
+          port-count: 100
+          port: 5701
+      #cp-subsystem:
+      #  cp-member-count: 3  # Número mínimo recomendado
+      #  group-size: 3       # Deve ser menor ou igual ao cp-member-count
+      #  session-time-to-live-seconds: 300
+      #  session-heartbeat-interval-seconds: 5
+      #  missing-cp-member-auto-removal-seconds: 14400
+      #  fail-on-indeterminate-operation-state: false
+      map:
+        default:
+          backup-count: 1
+          async-backup-count: 1
+      properties:
+        hazelcast.partition.count: 271
+        hazelcast.operation.thread.count: 2
+        hazelcast.io.thread.count: 3
+        hazelcast.operation.generic.thread.count: 2
+        hazelcast.operation.responsequeue.idlestrategy: backoff
+
+# Recursos do container
+resources:
+  requests:
+    memory: "6Gi"
+    cpu: "2"
+  limits:
+    memory: "8Gi"
+    cpu: "4"
+
+# Configurações de JVM
+javaOpts: >-
+  -Xms4G
+  -Xmx4G
+  -XX:+UseG1GC
+  -XX:MaxGCPauseMillis=200
+  -XX:+ParallelRefProcEnabled
+  -XX:+UseStringDeduplication
+  -XX:G1HeapRegionSize=16m
+  -XX:+UnlockExperimentalVMOptions
+  -XX:G1NewSizePercent=30
+  -XX:G1MaxNewSizePercent=40
+  -XX:InitiatingHeapOccupancyPercent=65
+  -Xlog:gc*=info:file=/opt/hazelcast/logs/gc.log:time,uptime,level,tags:filesize=50m,filecount=5
+
+# Configurações de persistência
+persistence:
+  enabled: true
+  storageClass: "managed-csi-premium"  # Classe recomendada para produção
+  accessModes:
+    - ReadWriteOnce
+  size: 20Gi
+
+# Configurações de serviço
+service:
+  type: ClusterIP
+  port: 5701
+
+# Configurações de liveness e readiness
+livenessProbe:
+  enabled: true
+  initialDelaySeconds: 30
+  periodSeconds: 10
+  timeoutSeconds: 5
+  failureThreshold: 3
+  successThreshold: 1
+
+readinessProbe:
+  enabled: true
+  initialDelaySeconds: 30
+  periodSeconds: 10
+  timeoutSeconds: 5
+  failureThreshold: 3
+  successThreshold: 1
+
+# Métricas e monitoramento
+metrics:
+  enabled: true
+  service:
+    type: ClusterIP
+    port: 8080
+
+# Configurações de segurança
+securityContext:
+  runAsUser: 65534
+  fsGroup: 65534
+  runAsNonRoot: true
+
+# Configurações de afinidade e anti-afinidade
+affinity:
+  podAntiAffinity:
+    preferredDuringSchedulingIgnoredDuringExecution:
+    - weight: 100
+      podAffinityTerm:
+        labelSelector:
+          matchExpressions:
+          - key: app.kubernetes.io/name
+            operator: In
+            values:
+            - hazelcast
+        topologyKey: kubernetes.io/hostname
+
+# Configuração do Management Center
+mancenter:
+  enabled: true
+  image:
+    repository: hazelcast/management-center
+    tag: "5.3.4"  # Mesma versão do IMDG
+  resources:
+    requests:
+      memory: "1Gi"
+      cpu: "0.5"
+    limits:
+      memory: "2Gi"
+      cpu: "1"
+  service:
+    type: ClusterIP
+    port: 8080
+  persistence:
+    enabled: true
+    size: 10Gi
+    storageClass: "default"
+  mancenter:
+  javaOpts: >-
+    -Xms512M 
+    -Xmx1024M 
+    -Dhazelcast.mc.lock.skip=true
+  licenseKey: ""
+  security:
+    enabled: true
+    adminUser: "admin"
+    adminPassword: "admin-pass-123"
+  
+  ingress:
+    enabled: true
+    className: nginx
+    annotations:
+      kubernetes.io/ingress.class: nginx
+      nginx.ingress.kubernetes.io/ssl-redirect: "false"
+    hosts:
+      - hazelcast-mc.20230830.demo-latam.axway.com
+  yaml:
+    hazelcast-client:
+      cluster-name: "axway-cluster"
+      network:
+        kubernetes:
+          enabled: true
+          namespace: "${namespace}"
+          use-public-ip: false

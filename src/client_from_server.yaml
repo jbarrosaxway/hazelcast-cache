@@ -1,0 +1,7 @@
+hazelcast-client:
+  cluster-name: "axway-cluster"  # Define o nome do cluster aqui
+  network:
+    kubernetes:
+      enabled: true
+      namespace: ${namespace}
+      service-name: ${serviceName}
