@@ -1,0 +1,28 @@
+$yaml = @"
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: numa-check
+  labels:
+    app: numa-check
+spec:
+  selector:
+    matchLabels:
+      app: numa-check
+  template:
+    metadata:
+      labels:
+        app: numa-check
+    spec:
+      containers:
+      - name: numa-check
+        image: ubuntu:latest
+        command: ["/bin/sh"]
+        args: ["-c", "apt-get update && apt-get install -y numactl && numactl --hardware && sleep 3600"]
+        resources:
+          requests:
+            cpu: "100m"
+            memory: "100Mi"
+"@
+
+$yaml | kubectl apply -f -

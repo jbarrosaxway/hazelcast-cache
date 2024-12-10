@@ -42,6 +42,7 @@ import com.vordel.trace.Trace;
 public class HazelcastCacheManager implements LoadableModule {
     private volatile HazelcastInstance hazelcastInstance;
     private static final String DEFAULT_INSTANCE_NAME = "axway-instance";
+    private static final String RATE_LIMIT_TYPE_ATOMIC = "atomic";
     private static final String DEFAULT_PORT = "5701";
     
     // Constantes para otimização
@@ -70,9 +71,7 @@ public class HazelcastCacheManager implements LoadableModule {
         config.setProperty("hazelcast.phone.home.enabled", "false");
         config.setProperty("hazelcast.jmx", "false");
         
-        // Adicionar configuração do tipo de rate limit
-        String rateLimitType = props.getProperty("env.HAZELCAST.ratelimit.type", "atomic");
-        config.setProperty("hazelcast.ratelimit.type", rateLimitType);
+
     }
 
     private Properties loadProperties(String filePath) {
@@ -108,8 +107,11 @@ public class HazelcastCacheManager implements LoadableModule {
             } else {
                 initializeServerMode(props);
             }
+            
+            // Definir a propriedade do sistema para o tipo de rate limit
+            String rateLimitType = props.getProperty("env.HAZELCAST.ratelimit.type", RATE_LIMIT_TYPE_ATOMIC);
             // Inicializa o RateLimitUtil com a instância correta
-            RateLimitUtil.getInstance(hazelcastInstance);
+            RateLimitUtil.getInstance(hazelcastInstance, rateLimitType);
             addClusterMembershipListener(hazelcastInstance);
             monitorClusterMembers(hazelcastInstance);
             schedulePeriodicCleanup();

@@ -1,17 +1,48 @@
 # Configuração básica do cluster
 cluster:
-  memberCount: 2
+  memberCount: 3
   cluster-name: "axway-cluster"  # Nome do cluster adicionado aqui
   
 image:
   tag: "5.3.8"  # Versão específica do IMDG
   repository: "hazelcast/hazelcast"
-  
+
+initContainers:
+  - name: sysctl-tuner
+    image: ubuntu:22.04
+    securityContext:
+      privileged: true
+      capabilities:
+        add:
+          - NET_ADMIN
+          - SYS_ADMIN
+    command:
+      - /bin/bash
+      - -c
+      - |
+        apt-get update && apt-get install -y procps
+        echo "Aplicando configurações de sysctl..."
+        sysctl -w net.core.rmem_max=134217728
+        sysctl -w net.core.wmem_max=134217728
+        sysctl -w net.ipv4.tcp_rmem="4096 87380 134217728"
+        sysctl -w net.ipv4.tcp_wmem="4096 87380 134217728"
+        echo "Verificando configurações aplicadas:"
+        sysctl net.core.rmem_max
+        sysctl net.core.wmem_max
+        sysctl net.ipv4.tcp_rmem
+        sysctl net.ipv4.tcp_wmem
+
 # Configurações do Hazelcast
 hazelcast:
   yaml:
     hazelcast:
       cluster-name: "axway-cluster"
+      serialization:
+        use-native-byte-order: true
+        allow-unsafe: true
+        enable-compression: false
+        enable-shared-object: false
+        portable-version: 0
       network:
         join:
           kubernetes:
@@ -31,16 +62,126 @@ hazelcast:
       #  missing-cp-member-auto-removal-seconds: 14400
       #  fail-on-indeterminate-operation-state: false
       map:
+        "rate-limit*":
+          eviction:
+            eviction-policy: LRU
+            max-size-policy: FREE_HEAP_PERCENTAGE  
+            size: 20
+          time-to-live-seconds: 1800        # Correto: time-to-live-seconds em vez de ttl-seconds
+          max-idle-seconds: 900             # Este está correto
+          backup-count: 0
+          async-backup-count: 0
+          statistics-enabled: false
+          per-entry-stats-enabled: false
+          in-memory-format: BINARY
         default:
           backup-count: 1
           async-backup-count: 1
+          eviction:
+            eviction-policy: LRU
+            max-size-policy: FREE_HEAP_PERCENTAGE
+            size: 20
       properties:
-        hazelcast.partition.count: 271
-        hazelcast.operation.thread.count: 2
-        hazelcast.io.thread.count: 3
-        hazelcast.operation.generic.thread.count: 2
-        hazelcast.operation.responsequeue.idlestrategy: backoff
+        hazelcast.performance.monitoring.enabled: "true"
+        hazelcast.performance.monitoring.delay.seconds: "10"
+        hazelcast.memory.free.min.percentage: "25"
+        hazelcast.memory.free.max.percentage: "35"
+        hazelcast.gc.check.period.seconds: "10"
+        # Limitar proxies
+        hazelcast.max.proxy.count: 1000
+        hazelcast.proxy.count.check.interval: 60
+        
+        # Ajustar cache
+        hazelcast.mc.cache.max.size: 512  # Reduzir de 2048
+        # Memory Management
+        hazelcast.max.heap.size.mb: "6144"
 
+        # GC Settings
+        hazelcast.gc.threshold.warning: "70"
+        hazelcast.gc.threshold.error: "85"
+
+        hazelcast.query.predicate.parallel.evaluation: "true"
+        hazelcast.query.max.local.partition.limit.track.count: "100000"
+        hazelcast.operation.call.timeout.millis: "60000"
+
+        # Socket Buffer Sizes
+        hazelcast.socket.receive.buffer.size: "131072"
+        hazelcast.socket.send.buffer.size: "131072"
+        # Network Thread Configs
+        hazelcast.operation.thread.count: "2"
+        hazelcast.io.thread.count: "3"
+        hazelcast.operation.generic.thread.count: "2"
+
+        hazelcast.backup.acks.enabled: "true"
+        hazelcast.backup.timeout.millis: "5000"
+        hazelcast.client.heartbeat.interval: "5000"
+        hazelcast.client.heartbeat.timeout: "60000"
+        hazelcast.client.max.no.heartbeat.seconds: "300"
+
+        hazelcast.internal.map.expiration.cleanup.percentage: "100"
+        hazelcast.internal.map.expiration.task.period.seconds: "1"
+        hazelcast.map.eviction.batch.size: "250"
+        hazelcast.map.eviction.cleanup.operation.count: "250"
+        hazelcast.map.expiration.cleanup.operation.count: "500"
+        hazelcast.map.invalidation.batch.size: "250"
+        hazelcast.jmx: "false"
+        hazelcast.logging.type: "slf4j"
+        
+        hazelcast.map.expiration.cleanup.threshold.percent: "25"
+        hazelcast.map.invalidation.batch.enabled: "true"
+        
+        hazelcast.map.write.behind.queue.capacity: "100"
+
+        hazelcast.native.memory.allocator.type: "POOLED"
+        hazelcast.native.memory.enabled: "true"
+        hazelcast.operation.backup.timeout.millis: "5000"
+        
+        hazelcast.operation.responsequeue.idlestrategy: "backoff"
+        
+        hazelcast.partition.count: "271"
+        hazelcast.phone.home.enabled: "false"
+        hazelcast.socket.connect.timeout.seconds: "5"
+        hazelcast.socket.keep.alive: "true"
+        hazelcast.socket.no.delay: "true"
+        hazelcast.wait.seconds.before.join: "5"
+
+        hazelcast.native.memory.size.mb: "3072"  # 3GB
+        hazelcast.native.memory.metadata.space.percentage: "25"
+
+
+
+
+  # Configurações de JVM
+  javaOpts: >-
+    -Xms6G
+    -Xmx6G
+    -XX:+UnlockExperimentalVMOptions
+    -XX:+UseG1GC
+    -XX:MaxGCPauseMillis=500
+    -XX:G1HeapRegionSize=32m
+    -XX:+ParallelRefProcEnabled
+    -XX:+UseStringDeduplication
+    -XX:G1NewSizePercent=15
+    -XX:G1MaxNewSizePercent=25
+    -XX:InitiatingHeapOccupancyPercent=35
+    -XX:+UseNUMA
+    -XX:+AlwaysPreTouch
+    -XX:+DisableExplicitGC
+    -XX:NativeMemoryTracking=detail
+
+
+  # Métricas e monitoramento
+  metrics:
+    enabled: true
+    service:
+      type: ClusterIP
+      port: 8080
+
+  # Configurações de segurança
+  securityContext:
+    runAsUser: 65534
+    fsGroup: 65534
+    runAsNonRoot: true
 # Recursos do container
 resources:
   requests:
@@ -49,22 +190,9 @@ resources:
   limits:
     memory: "8Gi"
     cpu: "4"
-
-# Configurações de JVM
-javaOpts: >-
-  -Xms4G
-  -Xmx4G
-  -XX:+UseG1GC
-  -XX:MaxGCPauseMillis=200
-  -XX:+ParallelRefProcEnabled
-  -XX:+UseStringDeduplication
-  -XX:G1HeapRegionSize=16m
-  -XX:+UnlockExperimentalVMOptions
-  -XX:G1NewSizePercent=30
-  -XX:G1MaxNewSizePercent=40
-  -XX:InitiatingHeapOccupancyPercent=65
-  -Xlog:gc*=info:file=/opt/hazelcast/logs/gc.log:time,uptime,level,tags:filesize=50m,filecount=5
-
+  # Configurações de afinidade e anti-afinidade
+nodeSelector:
+  agentpool: hazelcast
 # Configurações de persistência
 persistence:
   enabled: true
@@ -72,81 +200,97 @@ persistence:
   accessModes:
     - ReadWriteOnce
   size: 20Gi
-
-# Configurações de serviço
-service:
-  type: ClusterIP
-  port: 5701
-
-# Configurações de liveness e readiness
-livenessProbe:
-  enabled: true
-  initialDelaySeconds: 30
-  periodSeconds: 10
-  timeoutSeconds: 5
-  failureThreshold: 3
-  successThreshold: 1
-
-readinessProbe:
-  enabled: true
-  initialDelaySeconds: 30
-  periodSeconds: 10
-  timeoutSeconds: 5
-  failureThreshold: 3
-  successThreshold: 1
-
-# Métricas e monitoramento
-metrics:
-  enabled: true
-  service:
-    type: ClusterIP
-    port: 8080
-
-# Configurações de segurança
-securityContext:
-  runAsUser: 65534
-  fsGroup: 65534
-  runAsNonRoot: true
-
-# Configurações de afinidade e anti-afinidade
-affinity:
-  podAntiAffinity:
-    preferredDuringSchedulingIgnoredDuringExecution:
-    - weight: 100
-      podAffinityTerm:
-        labelSelector:
-          matchExpressions:
-          - key: app.kubernetes.io/name
-            operator: In
-            values:
-            - hazelcast
-        topologyKey: kubernetes.io/hostname
-
 # Configuração do Management Center
 mancenter:
   enabled: true
   image:
     repository: hazelcast/management-center
     tag: "5.3.4"  # Mesma versão do IMDG
-  resources:
-    requests:
-      memory: "1Gi"
-      cpu: "0.5"
-    limits:
-      memory: "2Gi"
-      cpu: "1"
+  # Aumentar recursos
+  requests:
+    memory: "3Gi"  # Aumentado de 2Gi
+    cpu: "1"
+  limits:
+    memory: "4Gi"  # Aumentado de 3Gi
+    cpu: "2"
+  # Configurar volume mounts no container principal
+  volumeMounts:
+    - name: mc-storage
+      mountPath: /data
+    - name: metrics-storage
+      mountPath: /data/metrics
+    - name: heap-dumps
+      mountPath: /opt/hazelcast/mc/heap-dumps
   service:
     type: ClusterIP
     port: 8080
   persistence:
     enabled: true
-    size: 10Gi
-    storageClass: "default"
-  mancenter:
+    size: 20Gi  # Aumentado de 10Gi
+    storageClass: "managed-csi-premium"
+    accessModes:
+      - ReadWriteOnce
+  # Configurar volume para heap dumps
+  volumes:
+    - name: mc-storage
+      persistentVolumeClaim:
+        claimName: hz-mc-storage
+    - name: metrics-storage
+      persistentVolumeClaim:
+        claimName: hz-mc-metrics
+    - name: heap-dumps
+      emptyDir: {}
+
+
+  # Configurar security context
+  securityContext:
+    runAsUser: 65534
+    runAsGroup: 65534
+    fsGroup: 65534
+  
   javaOpts: >-
-    -Xms512M 
-    -Xmx1024M 
-    -Dhazelcast.mc.lock.skip=true
+    -Xms2G 
+    -Xmx3G
+    -XX:+UseG1GC
+    -XX:MaxGCPauseMillis=200
+    -XX:+HeapDumpOnOutOfMemoryError
+    -XX:HeapDumpPath=/opt/hazelcast/mc/heap-dumps/
+    -Dhazelcast.mc.max.client.response.size=20971520
+    -Dhazelcast.mc.max.visible.instance.count=100
+    -Dhazelcast.mc.max.client.message.size=20971520
+    -Dhazelcast.mc.metrics.storage.retention.seconds=259200
+    -Dhazelcast.mc.metrics.storage.frequency.seconds=30
+    -Dhazelcast.mc.metrics.storage.write.batch.size=100
+    -Dhazelcast.mc.rocksdb.metrics.storage.path=/data/metrics
+    -Dhazelcast.mc.rocksdb.write.buffer.size=64
+    -Dhazelcast.mc.rocksdb.max.write.buffer.number=4
+    -Dhazelcast.mc.rocksdb.block.cache.size=512
+    -Dspring.datasource.url=jdbc:h2:file:/data/hazelcast-mancenter;DB_CLOSE_ON_EXIT=FALSE;AUTO_SERVER=TRUE;MULTI_THREADED=TRUE
+    -Dspring.jpa.properties.hibernate.jdbc.batch_size=50
+    -Dspring.jpa.properties.hibernate.order_inserts=true
+    -Dhazelcast.mc.healthCheck.enable=true
+    -XX:NativeMemoryTracking=detail
+  # Configurar liveness e readiness probes
+  livenessProbe:
+    httpGet:
+      path: /health
+      port: 8080
+    initialDelaySeconds: 120
+    periodSeconds: 30
+    timeoutSeconds: 10
+    failureThreshold: 3
+    successThreshold: 1
+
+  readinessProbe:
+    httpGet:
+      path: /health
+      port: 8080
+    initialDelaySeconds: 60
+    periodSeconds: 20
+    timeoutSeconds: 5
+    failureThreshold: 3
+    successThreshold: 1
+
   licenseKey: ""
   security:
     enabled: true

@@ -17,8 +17,8 @@ import com.datastax.driver.core.ColumnDefinitions;
 import com.datastax.driver.core.ConsistencyLevel;
 import com.datastax.driver.core.PreparedStatement;
 import com.datastax.driver.core.ResultSet;
+import com.datastax.driver.core.Row;
 import com.datastax.driver.core.Session;
-import com.hazelcast.core.Hazelcast;
 import com.hazelcast.core.HazelcastInstance;
 import com.hazelcast.cp.IAtomicLong;
 import com.hazelcast.map.IMap;
@@ -28,13 +28,18 @@ import com.vordel.el.Selector;
 import com.vordel.trace.Trace;
 
 public class RateLimitUtil {
-    private static final String RATE_LIMIT_TYPE_PROPERTY = "env.HAZELCAST.ratelimit.type";
-    private static final String RATE_LIMIT_TYPE_ATOMIC = "atomic";
     private static final String RATE_LIMIT_TYPE_MAP = "map";
-    public String rateLimitType = "atomic";
     private static volatile RateLimitUtil instance = null;
     private final ScheduledExecutorService scheduler;
     private volatile HazelcastInstance hazelcastInstance;
+    
+    private static final String CACHE_MAP_NAME = "rateLimitCache";
+    private static final String CACHE_KEY = "rateLimits:cassandra";
+
+    // Cache local para reduzir acessos ao Hazelcast
+    private volatile List<Map<String, Object>> localRateLimitCache;
+    private volatile long lastCacheUpdate;
+    private static final long CACHE_TTL = TimeUnit.MINUTES.toMillis(5); // 5 minutos de TTL
 
     // Usar ThreadLocal para evitar vazamentos de memória
     private static final ThreadLocal<Map<String, Object>> threadLocalCache = 
@@ -49,6 +54,7 @@ public class RateLimitUtil {
     
     // Cache para PreparedStatements
     private final Map<String, PreparedStatement> preparedStatementCache = new ConcurrentHashMap<>();
+	private String rateLimitType;
 
 
     
@@ -88,26 +94,29 @@ public class RateLimitUtil {
             }
         }));
     }
-    
-    
-    private RateLimitUtil(HazelcastInstance hazelcastInstance) {
+
+    private RateLimitUtil(HazelcastInstance hazelcastInstance, String rateLimitType) {
         this.hazelcastInstance = hazelcastInstance;
-		this.scheduler = null;
-        
-        Trace.info("RateLimitUtil iniciado com instância Hazelcast fornecida");
+        this.scheduler = null;
+        this.rateLimitType = rateLimitType;
+                
+        Trace.info("RateLimitUtil iniciado com instância Hazelcast fornecida. Tipo de rate limit: " + rateLimitType);
     }
 
-    public static RateLimitUtil getInstance(HazelcastInstance hazelcastInstance) {
+    public static RateLimitUtil getInstance(HazelcastInstance hazelcastInstance, String rateLimitType) {
         if (instance == null) {
             synchronized (RateLimitUtil.class) {
                 if (instance == null) {
-                    instance = new RateLimitUtil(hazelcastInstance);
+                    instance = new RateLimitUtil(hazelcastInstance, rateLimitType);
                 }
             }
         }
         return instance;
     }
 
+	public static RateLimitUtil getInstance() {
+		return instance;
+	}
 
     private HazelcastInstance getHazelcastInstance() {
         // Não precisamos mais procurar a instância, pois ela já foi injetada
@@ -133,60 +142,101 @@ public class RateLimitUtil {
         return keySpace + "." + table;
     }
     
-    // Melhorar o gerenciamento de cache
     private List<Map<String, Object>> getRateLimit(Dictionary msg) {
-        IMap<String, List<Map<String, Object>>> cache = getHazelcastInstance().getMap("rateLimitCache");
-        String cacheKey = "rateLimits:cassandra";
-
-        return cache.computeIfAbsent(cacheKey, k -> {
-            try {
-                return fetchRateLimitsFromCassandra();
-            } catch (Exception e) {
-                Trace.error("Erro ao buscar rate limits do Cassandra", e);
-                return new ArrayList<>();
+        // Primeiro, tenta usar o cache local
+        List<Map<String, Object>> currentCache = localRateLimitCache;
+        long currentTime = System.currentTimeMillis();
+        
+        if (currentCache != null && (currentTime - lastCacheUpdate) < CACHE_TTL) {
+            return currentCache;
+        }
+        
+        // Se não há cache local ou expirou, busca do Hazelcast
+        try {
+            IMap<String, List<Map<String, Object>>> cache = getHazelcastInstance().getMap(CACHE_MAP_NAME);
+            List<Map<String, Object>> rateLimits = cache.get(CACHE_KEY);
+            
+            if (rateLimits == null) {
+                // Se não existe no Hazelcast, busca do Cassandra
+                rateLimits = fetchAndCacheRateLimits(cache);
             }
-        });
+            
+            // Atualiza o cache local
+            localRateLimitCache = rateLimits;
+            lastCacheUpdate = currentTime;
+            
+            return rateLimits;
+            
+        } catch (Exception e) {
+            Trace.error("Erro ao obter rate limits do cache", e);
+            // Em caso de erro, retorna o cache local se disponível, ou lista vazia
+            return currentCache != null ? currentCache : new ArrayList<>();
+        }
+    }
+    
+    private List<Map<String, Object>> fetchAndCacheRateLimits(IMap<String, List<Map<String, Object>>> cache) {
+        try {
+            List<Map<String, Object>> rateLimits = fetchRateLimitsFromCassandra();
+            if (!rateLimits.isEmpty()) {
+                cache.set(CACHE_KEY, rateLimits, CACHE_TTL, TimeUnit.MILLISECONDS);
+            }
+            return rateLimits;
+        } catch (Exception e) {
+            Trace.error("Erro ao buscar rate limits do Cassandra", e);
+            return new ArrayList<>();
+        }
     }
 
     private List<Map<String, Object>> fetchRateLimitsFromCassandra() {
-        ClusterConnectionPool cassandraConnectionPool = CassandraObjectFactory.getClusterConnectionPool();
-        Session session = cassandraConnectionPool.getSession();
-        String keyspace = cassandraConnectionPool.getKeySpace();
-        String table = "\"Axway_RateLimit\"".toLowerCase();
-        
-        String select = "SELECT * FROM " + getFullyQualifiedTable(keyspace, table);
-        
-        // Usar cache de PreparedStatement
-        PreparedStatement ps = preparedStatementCache.computeIfAbsent(select, 
-            k -> session.prepare(k).setConsistencyLevel(getConsistencyLevel(keyspace, table)));
-            
-        ResultSet rs = session.execute(ps.bind());
-        
-        return processResultSet(rs);
-    }
-
-    private List<Map<String, Object>> processResultSet(ResultSet rs) {
-        if (rs.isExhausted()) {
-            return new ArrayList<>();
-        }
-
         List<Map<String, Object>> results = new ArrayList<>();
+        ClusterConnectionPool connectionPool = null;
+        
+        try {
+            connectionPool = CassandraObjectFactory.getClusterConnectionPool();
+            final Session session = connectionPool.getSession();
+            String keyspace = connectionPool.getKeySpace();
+            String table = "\"Axway_RateLimit\"".toLowerCase();
+            
+            String select = "SELECT * FROM " + getFullyQualifiedTable(keyspace, table);
+            
+            // Usar cache de PreparedStatement
+            PreparedStatement ps = preparedStatementCache.computeIfAbsent(select, 
+                k -> session.prepare(k).setConsistencyLevel(getConsistencyLevel(keyspace, table)));
+                
+            ResultSet rs = session.execute(ps.bind());
+            
+            if (!rs.isExhausted()) {
+                processResultSet(rs, results);
+            }
+            
+        } catch (Exception e) {
+            Trace.error("Erro ao buscar dados do Cassandra", e);
+        }
+        
+        return results;
+    }
+    
+    private void processResultSet(ResultSet rs, List<Map<String, Object>> results) {
         ColumnDefinitions columnDefs = rs.getColumnDefinitions();
         
-        for (com.datastax.driver.core.Row row : rs) {
+        for (Row row : rs) {
             Map<String, Object> result = new HashMap<>();
+            
             for (ColumnDefinitions.Definition def : columnDefs) {
                 String name = def.getName();
                 if (!TableEnum.KEY.getValue().equals(name)) {
-                    String value = row.getString("\"" + name + "\"");
+                    String quotedName = "\"" + name + "\"";
+                    String value = row.getString(quotedName);
                     if (value != null) {
                         result.put(name, value.replaceAll("^\"|\"$", ""));
                     }
                 }
             }
-            results.add(result);
+            
+            if (!result.isEmpty()) {
+                results.add(result);
+            }
         }
-        return results;
     }
 
     // Método para limpar ThreadLocal
@@ -203,8 +253,9 @@ public class RateLimitUtil {
     }
 
 
-    public boolean validateRateLimit(Message msg, String userKeySelectorParam) {        
-        if (RATE_LIMIT_TYPE_MAP.equalsIgnoreCase(rateLimitType)) {
+    public boolean validateRateLimit(Message msg, String userKeySelectorParam) {
+        // Usar a variável de instância em vez de tentar obter da configuração
+        if (RATE_LIMIT_TYPE_MAP.equalsIgnoreCase(this.rateLimitType)) {
             return validateRateLimitUsingMap(msg, userKeySelectorParam);
         } else {
             return validateRateLimitUsingAtomic(msg, userKeySelectorParam);
@@ -213,123 +264,203 @@ public class RateLimitUtil {
 
 
     public boolean validateRateLimitUsingAtomic(Message msg, String userKeySelectorParam) {
+        // Cache de StringBuilder para reutilização
+        StringBuilder sb = new StringBuilder(128);
+        
+        // Obter rateLimits uma única vez
         List<Map<String, Object>> rateLimits = getRateLimit(msg);
-        Trace.debug("Rate limits: " + rateLimits.toString());
-        long currentTime = System.currentTimeMillis();
-
         if (rateLimits.isEmpty()) {
             return true;
-        } else {
-            for (Map<String, Object> rateLimit : rateLimits) {
-                String rateLimitKeyBD = (String) rateLimit.get("rateLimitkey");
-                Trace.debug("Rate limit key: " + rateLimitKeyBD);
-                String rateLimitKeySelector = (String) rateLimit.get("rateLimitkeySelector");
-                Trace.debug("Rate limit key selector: " + rateLimitKeySelector);
-                
-                String[] result = isRateLimitApplicable(msg, rateLimitKeyBD, rateLimitKeySelector, userKeySelectorParam);
-                boolean isApplicable = Boolean.parseBoolean(result[0]);
-                String selectorValue = result[1];
-                
-                if (isApplicable) {
-                    boolean isValid = true;
-                    Number rateLimitValue = Long.parseLong((String) rateLimit.get("rateLimit"));
-                    Integer timeInterval = Integer.parseInt((String) rateLimit.get("timeInterval"));
-                    String timeUnitStr = (String) rateLimit.get("timeUnit");
-                    TimeUnit timeUnit = mapStringToTimeUnit(timeUnitStr);
-                    
-                    String counterName = RATE_LIMITER_PREFIX + selectorValue;
-                    IAtomicLong counter = getOrCreateCounter(counterName);
-                    
-                    if (counter == null) {
-                        // Fallback em caso de erro com CP Subsystem
-                        Trace.info("CP Subsystem não disponível, permitindo requisição");
-                        return true;
-                    }
-                    
-                    // Verifica se o contador existe e está dentro do período válido
-                    IMap<String, Long> expirationMap = hazelcastInstance.getMap(RATE_LIMITER_PREFIX + "expiration");
-                    Long lastResetTime = expirationMap.get(counterName);
-                    
-                    if (lastResetTime == null || (currentTime - lastResetTime) >= timeUnit.toMillis(timeInterval)) {
-                        // Reset do contador se o período expirou
-                        counter.set(0);
-                        expirationMap.put(counterName, currentTime, timeInterval, timeUnit);
-                        Trace.debug("Counter reset for " + counterName);
-                    }
-                    
-                    // Incrementa o contador
-                    long currentCount = counter.incrementAndGet();
-                    Trace.debug("Current count for " + counterName + ": " + currentCount);
-                    
-                    if (currentCount > rateLimitValue.longValue()) {
-                        Trace.debug("Rate limit exceeded for " + counterName);
-                        isValid = false;
-                    }
-                    
-                    // Atualiza métricas na mensagem
-                    msg.put(counterName + ".is-exceeded", !isValid);
-                    long remain = rateLimitValue.longValue() - currentCount;
-                    msg.put(counterName + ".remain", !isValid ? 0 : remain);
-                    
-                    return isValid;
-                }
-            }
-            return true;
         }
-    }
-    
 
-    private boolean validateRateLimitUsingMap(Message msg, String userKeySelectorParam) {
-        List<Map<String, Object>> rateLimits = getRateLimit(msg);
-        String mapName;
-        Trace.debug("Rate limits: " + rateLimits.toString());
         long currentTime = System.currentTimeMillis();
         
-        if (rateLimits.isEmpty()) {
-            return true;
-        } else {
-            for (Map<String, Object> rateLimit : rateLimits) {
-                boolean isValid = true;
-                String rateLimitKeyBD = (String) rateLimit.get("rateLimitkey");
-                String rateLimitKeySelector = (String) rateLimit.get("rateLimitkeySelector");
-                
-                Selector<String> keySelector = new Selector<>(rateLimitKeySelector, String.class);
-                Selector<String> key = new Selector<>(rateLimitKeyBD, String.class);
-                Selector<String> userKeySelector = new Selector<>(userKeySelectorParam, String.class);
-                
-                String selectorValue = keySelector.substitute(msg);
-                String selectorKey = key.substitute(msg);
-                String userKey = userKeySelector.substitute(msg);
-                
-                if (selectorKey.equals(selectorValue) && selectorKey.equals(userKey)) {
-                    Number rateLimitValue = Long.parseLong((String)rateLimit.get("rateLimit"));
-                    Integer timeInterval = Integer.parseInt((String)rateLimit.get("timeInterval"));
-                    String timeUnitStr = (String) rateLimit.get("timeUnit");
-                    TimeUnit timeUnit = mapStringToTimeUnit(timeUnitStr);
-                    
-                    mapName = selectorValue;
-                    IMap<String, Long> map = hazelcastInstance.getMap(mapName);
-                    
-                    int rate = validateRateLimitWithTTL(map);
-                    rate += 1;
-                    
-                    if (rate > rateLimitValue.intValue()) {
-                        isValid = false;
-                    } else {
-                        String identificadorReq = ""+msg.correlationId+"";
-                        map.put(identificadorReq, currentTime, timeInterval, timeUnit);
-                    }
-                    
-                    msg.put("rate-limit."+mapName+".is-exceeded", !isValid);
-                    int remain = rateLimitValue.intValue() - rate;
-                    msg.put("rate-limit."+mapName+".remain", !isValid?0:remain);
-                    return isValid;
-                }
+        // Classe auxiliar para evitar array
+        RateLimitResult result = new RateLimitResult();
+        
+        for (Map<String, Object> rateLimit : rateLimits) {
+            // Extrair valores do map uma única vez para evitar múltiplos gets
+            String rateLimitKeyBD = (String) rateLimit.get("rateLimitkey");
+            String rateLimitKeySelector = (String) rateLimit.get("rateLimitkeySelector");
+            
+            if (Trace.isDebugEnabled()) {
+                sb.setLength(0);
+                Trace.debug(sb.append("Rate limit key: ").append(rateLimitKeyBD).toString());
+                sb.setLength(0);
+                Trace.debug(sb.append("Rate limit key selector: ").append(rateLimitKeySelector).toString());
             }
-            return true;
+            
+            // Usar objeto reutilizável ao invés de array
+            checkRateLimitApplicability(msg, rateLimitKeyBD, rateLimitKeySelector, userKeySelectorParam, result);
+            
+            if (result.isApplicable()) {
+                // Parse valores numéricos de forma otimizada
+                long rateLimitValue = parseLongSafely(rateLimit.get("rateLimit"));
+                int timeInterval = parseIntSafely(rateLimit.get("timeInterval"));
+                TimeUnit timeUnit = mapStringToTimeUnit((String) rateLimit.get("timeUnit"));
+                
+                // Construir counterName reutilizando StringBuilder
+                sb.setLength(0);
+                String counterName = sb.append(RATE_LIMITER_PREFIX).append(result.getSelectorValue()).toString();
+                
+                IAtomicLong counter = getOrCreateCounter(counterName);
+                if (counter == null) {
+                    return true;
+                }
+                
+                // Verificar e atualizar contador
+                if (processCounter(counter, currentTime, timeInterval, timeUnit, rateLimitValue, msg, counterName)) {
+                    return false;
+                }
+                
+                return true;
+            }
+        }
+        return true;
+    }
+
+    // Classe auxiliar para evitar array
+    private static class RateLimitResult {
+        private boolean applicable;
+        private String selectorValue;
+        
+        public void update(boolean applicable, String selectorValue) {
+            this.applicable = applicable;
+            this.selectorValue = selectorValue;
+        }
+        
+        public boolean isApplicable() {
+            return applicable;
+        }
+        
+        public String getSelectorValue() {
+            return selectorValue;
         }
     }
 
+    // Métodos auxiliares otimizados
+    private void checkRateLimitApplicability(Message msg, String rateLimitKeyBD, 
+        String rateLimitKeySelector, String userKeySelectorParam, RateLimitResult result) {
+        
+        Selector<String> keySelector = new Selector<>(rateLimitKeySelector, String.class);
+        Selector<String> key = new Selector<>(rateLimitKeyBD, String.class);
+        Selector<String> userKeySelector = new Selector<>(userKeySelectorParam, String.class);
+
+        String selectorValue = keySelector.substitute(msg);
+        String selectorKey = key.substitute(msg);
+        String userKey = userKeySelector.substitute(msg);
+
+        result.update(selectorKey.equals(selectorValue) && selectorKey.equals(userKey), selectorValue);
+    }
+
+    private boolean processCounter(IAtomicLong counter, long currentTime, int timeInterval, 
+        TimeUnit timeUnit, long rateLimitValue, Message msg, String counterName) {
+        
+        IMap<String, Long> expirationMap = hazelcastInstance.getMap(RATE_LIMITER_PREFIX + "expiration");
+        Long lastResetTime = expirationMap.get(counterName);
+        
+        if (lastResetTime == null || (currentTime - lastResetTime) >= timeUnit.toMillis(timeInterval)) {
+            counter.set(0);
+            expirationMap.put(counterName, currentTime, timeInterval, timeUnit);
+        }
+        
+        long currentCount = counter.incrementAndGet();
+        boolean isExceeded = currentCount > rateLimitValue;
+        
+        updateMetrics(msg, counterName, !isExceeded, rateLimitValue - currentCount);
+        
+        return isExceeded;
+    }
+
+    private void updateMetrics(Message msg, String counterName, boolean isValid, long remain) {
+        msg.put(counterName + ".is-exceeded", !isValid);
+        msg.put(counterName + ".remain", isValid ? remain : 0);
+    }
+
+    private long parseLongSafely(Object value) {
+        if (value instanceof Number) {
+            return ((Number) value).longValue();
+        }
+        try {
+            return Long.parseLong(value.toString());
+        } catch (Exception e) {
+            return 0L;
+        }
+    }
+
+    private int parseIntSafely(Object value) {
+        if (value instanceof Number) {
+            return ((Number) value).intValue();
+        }
+        try {
+            return Integer.parseInt(value.toString());
+        } catch (Exception e) {
+            return 0;
+        }
+    }
+
+
+	public boolean validateRateLimitUsingMap(Message msg, String userKeySelectorParam) {
+		StringBuilder sb = new StringBuilder(128);
+		List<Map<String, Object>> rateLimits = getRateLimit(msg);
+
+		if (Trace.isDebugEnabled()) {
+			sb.setLength(0);
+			sb.append("Rate limits: ").append(rateLimits);
+			Trace.debug(sb.toString());
+		}
+
+		if (rateLimits.isEmpty()) {
+			return true;
+		}
+
+		long currentTime = System.currentTimeMillis();
+
+		for (Map<String, Object> rateLimit : rateLimits) {
+			String rateLimitKeyBD = (String) rateLimit.get("rateLimitkey");
+			String rateLimitKeySelector = (String) rateLimit.get("rateLimitkeySelector");
+
+			Selector<String> keySelector = new Selector<>(rateLimitKeySelector, String.class);
+			Selector<String> key = new Selector<>(rateLimitKeyBD, String.class);
+			Selector<String> userKeySelector = new Selector<>(userKeySelectorParam, String.class);
+
+			String selectorValue = keySelector.substitute(msg);
+			String selectorKey = key.substitute(msg);
+			String userKey = userKeySelector.substitute(msg);
+
+			if (selectorKey.equals(selectorValue) && selectorKey.equals(userKey)) {
+				long rateLimitValue = parseLongSafely(rateLimit.get("rateLimit"));
+				int timeInterval = parseIntSafely(rateLimit.get("timeInterval"));
+				TimeUnit timeUnit = mapStringToTimeUnit((String) rateLimit.get("timeUnit"));
+
+				String mapName = selectorValue;
+				IMap<String, Long> map = hazelcastInstance.getMap(mapName);
+
+				int rate = validateRateLimitWithTTL(map);
+				rate++;
+
+				boolean isValid = rate <= rateLimitValue;
+
+				if (isValid) {
+					// Usando a concatenação específica para correlationId
+					String identificadorReq = "" + msg.correlationId + "";
+					map.put(identificadorReq, currentTime, timeInterval, timeUnit);
+				}
+
+				// Construir chaves de métrica
+				sb.setLength(0);
+				sb.append("rate-limit.").append(mapName);
+				String metricBase = sb.toString();
+
+				msg.put(metricBase + ".is-exceeded", !isValid);
+				long remain = rateLimitValue - rate;
+				msg.put(metricBase + ".remain", !isValid ? 0 : remain);
+
+				return isValid;
+			}
+		}
+		return true;
+	}
     private int validateRateLimitWithTTL(IMap<String, Long> map) {
         return map.size();
     }
@@ -345,25 +476,6 @@ public class RateLimitUtil {
             }
         }
     }
-
-
-    private String[] isRateLimitApplicable(Message msg, String rateLimitKeyBD, String rateLimitKeySelector,
-            String userKeySelectorParam) {
-        Selector<String> keySelector = new Selector<>(rateLimitKeySelector, String.class);
-        Selector<String> key = new Selector<>(rateLimitKeyBD, String.class);
-        Selector<String> userKeySelector = new Selector<>(userKeySelectorParam, String.class);
-
-        String selectorValue = keySelector.substitute(msg);
-        String selectorKey = key.substitute(msg);
-        String userKey = userKeySelector.substitute(msg);
-
-        Trace.debug("Evaluator: " + selectorKey + ".equals(" + selectorValue + ") && " + selectorKey + ".equals("
-                + userKey + ")");
-
-        // Retorna um array com o resultado da validação e o selectorValue
-        return new String[]{String.valueOf(selectorKey.equals(selectorValue) && selectorKey.equals(userKey)), selectorValue};
-    }
-	
 
     
     public void destroy() {
