@@ -32,7 +32,7 @@ import com.hazelcast.config.SSLConfig;
 import com.hazelcast.config.TcpIpConfig;
 import com.hazelcast.core.Hazelcast;
 import com.hazelcast.core.HazelcastInstance;
-import com.hazelcast.memory.MemorySize;
+import com.hazelcast.memory.Capacity;
 import com.hazelcast.memory.MemoryUnit;
 import com.vordel.config.ConfigContext;
 import com.vordel.config.LoadableModule;
@@ -56,12 +56,69 @@ public class HazelcastCacheManager implements LoadableModule {
     private static final int DEFAULT_CONNECTION_MONITOR_INTERVAL = 5;
     private static final int DEFAULT_CONNECTION_MAX_FAULTS = 3;
     
+    // Constantes para retentativa de conexão ao Hazelcast
+    private static final String RETRY_ENABLED_PROP = "env.HAZELCAST.retry.enabled";
+    private static final String RETRY_COUNT_PROP = "env.HAZELCAST.retry.count";
+    private static final String RETRY_DELAY_PROP = "env.HAZELCAST.retry.delay.seconds";
+    private static final boolean DEFAULT_RETRY_ENABLED = true;
+    private static final int DEFAULT_RETRY_COUNT = 3;
+    private static final int DEFAULT_RETRY_DELAY = 5;
+    
 
     @Override
     public void configure(ConfigContext ctx, com.vordel.es.Entity entity) throws EntityStoreException {
     }
     
 
+    private boolean connectWithRetry(Properties props, Runnable connectionAttempt) {
+        boolean retryEnabled = Boolean.parseBoolean(
+            props.getProperty(RETRY_ENABLED_PROP, String.valueOf(DEFAULT_RETRY_ENABLED))
+        );
+        
+        if (!retryEnabled) {
+            try {
+                connectionAttempt.run();
+                return true;
+            } catch (Exception e) {
+                Trace.info("***** ERRO NA CONEXÃO HAZELCAST: " + e.getMessage() + " *****");
+                return false;
+            }
+        }
+
+        int maxRetries = Integer.parseInt(
+            props.getProperty(RETRY_COUNT_PROP, String.valueOf(DEFAULT_RETRY_COUNT))
+        );
+        int retryDelay = Integer.parseInt(
+            props.getProperty(RETRY_DELAY_PROP, String.valueOf(DEFAULT_RETRY_DELAY))
+        );
+
+        for (int attempt = 1; attempt <= maxRetries; attempt++) {
+            try {
+                connectionAttempt.run();
+                return true;
+            } catch (Exception e) {
+                String message = String.format(
+                    "***** TENTATIVA %d DE %d FALHOU AO CONECTAR AO HAZELCAST: %s *****",
+                    attempt, maxRetries, e.getMessage()
+                );
+                Trace.info(message);
+
+                if (attempt < maxRetries) {
+                    try {
+                        Thread.sleep(retryDelay * 1000L);
+                    } catch (InterruptedException ie) {
+                        Thread.currentThread().interrupt();
+                        break;
+                    }
+                }
+            }
+        }
+
+        Trace.info("***** TODAS AS TENTATIVAS DE CONEXÃO AO HAZELCAST FALHARAM *****");
+        return false;
+    }
+
+    
     private void configureBasicSettings(Config config, Properties props) {
     	config.getNetworkConfig().setPort(Integer.parseInt(props.getProperty("env.HAZELCAST.port", DEFAULT_PORT)));
 
@@ -96,10 +153,16 @@ public class HazelcastCacheManager implements LoadableModule {
                 throw new IllegalStateException("Não foi possível carregar as propriedades do arquivo: " + propFilePath);
             }
             
+            // Obter o nome da instância das propriedades
+            String instanceName = props.getProperty("env.HAZELCAST.instanceName", DEFAULT_INSTANCE_NAME);
+            
             // Novo parâmetro para determinar o modo de operação
             boolean isClientMode = Boolean.parseBoolean(
                 props.getProperty("env.HAZELCAST.client.mode.enabled", "false")
             );
+            
+            // Desligar instância existente antes de criar uma nova
+            shutdownExistingInstance(instanceName, isClientMode);
             
             
             if (isClientMode) {
@@ -129,103 +192,201 @@ public class HazelcastCacheManager implements LoadableModule {
             );
         }
     }
-
     private void initializeClientMode(Properties props) {
         Trace.info("Iniciando Hazelcast em modo cliente...");
-        ClientConfig clientConfig = new ClientConfig();
         
-        // Configurações básicas do cliente
+        connectWithRetry(props, () -> {
+            ClientConfig clientConfig = new ClientConfig();
+            
+            // Configurações básicas do cliente
+            configureClientBasicSettings(clientConfig, props);
+            configureClientNetworkSettings(clientConfig, props);
+            configureClientTimeouts(clientConfig, props);
+            
+            // Configurar descoberta
+            String ipList = props.getProperty("env.HAZELCAST.member.ips");
+            if (ipList != null && !ipList.isEmpty()) {
+                // Usar TCP/IP
+                Trace.info("Configurando membros TCP/IP para cliente: " + ipList);
+                for (String address : ipList.split(",")) {
+                    clientConfig.getNetworkConfig().addAddress(address.trim());
+                    Trace.info("Adicionado endereço do servidor: " + address.trim());
+                }
+            } else {
+                // Usar descoberta Kubernetes
+                Trace.info("Configurando descoberta via Kubernetes para cliente");
+                ClientNetworkConfig networkConfig = clientConfig.getNetworkConfig();
+                networkConfig.getKubernetesConfig()
+                    .setEnabled(true)
+                    .setProperty("namespace", props.getProperty("env.HAZELCAST.namespace", "axway"))
+                    .setProperty("service-name", props.getProperty("env.HAZELCAST.serviceName", "hazelcast"))
+                    .setProperty("service-port", props.getProperty("env.HAZELCAST.servicePort", DEFAULT_PORT))
+                    .setProperty("resolve-not-ready-addresses", "false")
+                    .setProperty("kubernetes-master", 
+                        props.getProperty("env.HAZELCAST.kubernetes.master", "https://kubernetes.default.svc"));
+            }
+            
+            hazelcastInstance = HazelcastClient.newHazelcastClient(clientConfig);
+            Trace.info("Hazelcast cliente iniciado com sucesso");
+        });
+    }
+    private void configureClientBasicSettings(ClientConfig clientConfig, Properties props) {
+		// Define o nome do cluster para o cliente. O nome do cluster é usado para
+		// identificar o cluster ao qual o cliente deve se conectar
         clientConfig.setClusterName(
             props.getProperty("env.HAZELCAST.cluster.name", "axway-cluster")
         );
-
-        // Configurar descoberta
-        String ipList = props.getProperty("env.HAZELCAST.member.ips");
-        if (ipList != null && !ipList.isEmpty()) {
-            // Usar TCP/IP
-            for (String address : ipList.split(",")) {
-                clientConfig.getNetworkConfig().addAddress(address.trim());
-            }
-        } else {
-            // Usar descoberta Kubernetes
-            ClientNetworkConfig networkConfig = clientConfig.getNetworkConfig();
-            networkConfig.getKubernetesConfig()
-                .setEnabled(true)
-                .setProperty("namespace", props.getProperty("env.HAZELCAST.namespace", "default"))
-                .setProperty("service-name", props.getProperty("env.HAZELCAST.serviceName", "hazelcast"))
-                .setProperty("resolve-not-ready-addresses", "false");
-        }
         
-        hazelcastInstance = HazelcastClient.newHazelcastClient(clientConfig);
-        Trace.info("Hazelcast cliente iniciado com sucesso");
+		// Configurações básicas adicionais para logging type: slf4j. Está sendo usado o
+		// slf4j como logging type
+        clientConfig.setProperty("hazelcast.logging.type", "slf4j");
+		// Configuração para desabilitar o phone home. O phone home é um recurso que
+		// envia dados de uso do Hazelcast para a Hazelcast Inc
+        clientConfig.setProperty("hazelcast.phone.home.enabled", "false");
+		// Configuração para habilitar as estatísticas do cliente. As estatísticas do
+		// cliente são úteis para monitorar o cliente e o cluster do Hazelcast
+        clientConfig.setProperty("hazelcast.client.statistics.enabled", "true");
+		// Configuração para habilitar a lista de membros do cluster para o cliente. A
+		// lista de membros do cluster é usada para determinar a ordem de conexão do
+		// cliente ao cluster
+        clientConfig.setProperty("hazelcast.client.shuffle.member.list", "true");
     }
 
+    private void configureClientNetworkSettings(ClientConfig clientConfig, Properties props) {
+        ClientNetworkConfig networkConfig = clientConfig.getNetworkConfig();
+        
+		// O que é smartRouting? R: SmartRouting é uma configuração que permite que o
+		// cliente se conecte a qualquer membro do cluster para enviar operações
+        networkConfig.setSmartRouting(true);
+		// O que é redoOperation? R: RedoOperation é uma operação que é reenviada para o
+		// cluster se o membro que a processou inicialmente falhar
+        networkConfig.setRedoOperation(true);
+                
+        // Configurações de reconexão com valores menores, aqui com default de 1 segundo
+        clientConfig.setProperty("hazelcast.client.invocation.retry.pause.millis", 
+            props.getProperty("env.HAZELCAST.client.invocation.retry.pause.millis", "1000"));
+
+        // Configuração de intervalo de heartbeat do hazelcast para 1 segundo
+        clientConfig.setProperty("hazelcast.client.heartbeat.interval",
+            props.getProperty("env.HAZELCAST.client.heartbeat.interval", "1000"));
+
+
+    }
+    // Método para configurar timeouts específicos do cliente
+    private void configureClientTimeouts(ClientConfig clientConfig, Properties props) {
+        // Timeout de conexão reduzido (5 segundos)
+        clientConfig.setProperty("hazelcast.client.connection.timeout", 
+            props.getProperty("env.HAZELCAST.client.connection.timeout", "5000"));
+        
+        // Configuração de timeout de operações de heartbeat do hazelcast para 5 segundos
+        clientConfig.setProperty("hazelcast.client.heartbeat.timeout",
+            props.getProperty("env.HAZELCAST.client.heartbeat.timeout", "5000"));
+        
+        // Configuração de timeout de invocação de operações do hazelcast para 5 segundos
+        clientConfig.setProperty("hazelcast.client.invocation.timeout.seconds",
+            props.getProperty("env.HAZELCAST.client.invocation.timeout.seconds", "5"));
+    }
+
+    // Método para configurar descoberta via TCP/IP ou kubernetes no modo servidor
     private void initializeServerMode(Properties props) {
         Trace.info("Iniciando Hazelcast em modo servidor...");
-        Config config = createOptimizedConfig(props, 
-            props.getProperty("env.HAZELCAST.port", DEFAULT_PORT), 
-            props.getProperty("env.HAZELCAST.instanceName", DEFAULT_INSTANCE_NAME)
-        );
         
-        // Configurações básicas do cliente
-        config.setClusterName(
-            props.getProperty("env.HAZELCAST.cluster.name", "axway-cluster")
-        );
+        connectWithRetry(props, () -> {
+            Config config = createOptimizedConfig(props);
+            
+			// Define o nome do cluster para o servidor. O nome do cluster é usado para
+			// identificar o cluster ao qual o servidor pertence
+            config.setClusterName(
+                props.getProperty("env.HAZELCAST.cluster.name", "axway-cluster")
+            );
 
-        config.setProperty("hazelcast.ignoreXxeProtectionFailures", "true");
-        
-        // Configurar descoberta usando o método existente
-        NetworkConfig networkConfig = config.getNetworkConfig();
-        JoinConfig joinConfig = networkConfig.getJoin();
-        
-        String ipList = props.getProperty("env.HAZELCAST.member.ips");
-        if (ipList != null && !ipList.isEmpty()) {
-            configureTcpIpDiscovery(joinConfig, ipList);
-        } else {
-            configureKubernetesDiscovery(joinConfig, props);
-        }
+            // Define a opção para ignorar falhas de proteção contra ataques XXE
+            config.setProperty("hazelcast.ignoreXxeProtectionFailures", "true");
+            
+            NetworkConfig networkConfig = config.getNetworkConfig();
+            JoinConfig joinConfig = networkConfig.getJoin();
+            
+            String ipList = props.getProperty("env.HAZELCAST.member.ips");
+			// Configurar descoberta via TCP/IP ou Kubernetes na ordem de prioridade
+			// definida no arquivo de propriedades, primeiro TCP/IP, depois Kubernetes
+            if (ipList != null && !ipList.isEmpty()) {
+                configureTcpIpDiscovery(joinConfig, ipList);
+            } else {
+                configureKubernetesDiscovery(joinConfig, props);
+            }
 
-        hazelcastInstance = Hazelcast.newHazelcastInstance(config);
-        Trace.info("Hazelcast servidor iniciado com sucesso");
+            hazelcastInstance = Hazelcast.newHazelcastInstance(config);
+            Trace.info("Hazelcast servidor iniciado com sucesso");
+        });
     }
     
+    // Método para configurar memoria, operações e limites de conexão no modo servidor
     private void configureMemoryLimits(Config config, Properties props) {
-        // Configuração de limites de heap
+		// Configuração de memória minima em percentual. Essa configuracao define o
+		// percentual minimo de memória livre que o Hazelcast deve manter
         config.setProperty("hazelcast.memory.free.min.percentage", 
             props.getProperty("env.HAZELCAST.memory.free.min.percentage", "20"));
+		// Configuração de memória máxima em percentual. Essa configuracao define o
+		// percentual máximo de memória livre que o Hazelcast deve manter
         config.setProperty("hazelcast.memory.free.max.percentage", 
             props.getProperty("env.HAZELCAST.memory.free.max.percentage", "30"));
         
-        // Configuração de heap máximo
+		// Configuração de heap máximo. Essa configuracao define o tamanho máximo do
+		// heap em MB para o Hazelcast usar
         int maxHeapMB = Integer.parseInt(
             props.getProperty("env.HAZELCAST.max.heap.mb", "4096")); // 4GB default
         config.setProperty("hazelcast.max.heap.size.mb", String.valueOf(maxHeapMB));
 
-        // Configuração de native memory
+		// Configuração de native memory. Essa configuracao define o uso de memória
+		// nativa do Hazelcast para armazenamento de dados em cache em vez de usar heap.
+		// Ele usa a Heap antes se este parametro for definido, mesmo que definido o max
+		// heap? R: Sim. O uso de memória nativa é uma configuração opcional e
+		// independente do heap. Se a memória nativa estiver ativada, o Hazelcast usará
+		// a memória nativa
         config.getNativeMemoryConfig()
             .setEnabled(true)
-            .setSize(new MemorySize(maxHeapMB, MemoryUnit.MEGABYTES))
+            .setCapacity(Capacity.of(maxHeapMB, MemoryUnit.MEGABYTES))
             .setMinBlockSize(16)
             .setPageSize(1 << 20) // 1MB
             .setMetadataSpacePercentage(40);
 
-        // Configurações adicionais de memória
+		// Configuração de memória elástica. Essa configuracao define se a memória
+		// elástica está ativada ou não no Hazelcast. O que é memória elástica? R: A
+		// memória elástica é uma configuração que permite que o Hazelcast ajuste
+		// dinamicamente o uso de memória com base na carga de trabalho
         config.setProperty("hazelcast.elastic.memory.enabled", "true");
+		// Configuração de tamanho total da memória elástica. Essa configuracao define o
+		// tamanho total da memória elástica em MB que o Hazelcast pode usar
         config.setProperty("hazelcast.elastic.memory.total.size.mb", String.valueOf(maxHeapMB));
+		// Configuração de memory leak detector. Essa configuracao define se o detector
+		// de vazamento de memória está ativado ou não. Se ativado o Hazelcast irá
+		// verificar se há vazamentos de memória em intervalos regulares e gerar um
+		// relatório. Este relatório é gerado onde? R: O relatório é gerado no log de um
+		// nó do Hazelcast onde o vazamento foi detectado. Em qual formato? R: O
+		// relatório é gerado em formato de texto
         config.setProperty("hazelcast.memory.leak.detector.enabled", "true");
         
-        // Configuração de GC
+        // Configururação de GC mais frequente para monitorar a memória
         config.setProperty("hazelcast.gc.check.period.seconds", "30");
+		// Configuração de alerta de memória. O que acontece se o limite de alerta de
+		// memória for atingido? R: Se o limite de alerta de memória for atingido, o
+		// Hazelcast tentará liberar memória para evitar um alerta de memória
         config.setProperty("hazelcast.gc.threshold.warning", "70");
+		// Configuração de erro de memória. O que acontece se o limite de erro de
+		// memória for atingido? R: Se o limite de erro de memória for atingido, o
+		// Hazelcast tentará liberar memória para evitar uma exceção de OutOfMemoryError
         config.setProperty("hazelcast.gc.threshold.error", "90");
     }
 
     private void configureConnectionLimits(Config config, Properties props) {
         NetworkConfig networkConfig = config.getNetworkConfig();
         
-        // Configurações de conexão
+        // Configurações de monitoramento de conexão
         config.setProperty("hazelcast.connection.monitor.interval", 
             props.getProperty("env.HAZELCAST.connection.monitor.interval", "5"));
+		// Configurações de monitoramento de falhas. O que acontece se o valor definido
+		// for atingido? R: Se o valor definido for atingido, o Hazelcast irá marcar o
+		// membro como suspeito
         config.setProperty("hazelcast.connection.monitor.max.faults", 
             props.getProperty("env.HAZELCAST.connection.monitor.max.faults", "3"));
         
@@ -235,9 +396,14 @@ public class HazelcastCacheManager implements LoadableModule {
             .setPortAutoIncrement(true)
             .setPortCount(100);
         
-        // Configurações de timeout e conexão
+		// Configurações de timeout e conexão. Este timeout afeta qual tipo de conexão
+		// do hazelcast, entre membros ou somente cliente? R: Este timeout afeta a
+		// conexão entre membros do cluster 
         config.setProperty("hazelcast.socket.connect.timeout.seconds", 
             props.getProperty("env.HAZELCAST.socket.connect.timeout", "5"));
+		// Configuração de keep-alive do socket. Este sokect é o socket de conexão entre
+		// cliente membros do cluster ou cliente? R: O socket de conexão entre membros
+		// do cluster
         config.setProperty("hazelcast.socket.keep.alive", "true");
         
         // Configurações de pool de conexões
@@ -285,47 +451,122 @@ public class HazelcastCacheManager implements LoadableModule {
     }
 
     
-    private void shutdownExistingInstance(String instanceName) {
-        HazelcastInstance existingInstance = Hazelcast.getHazelcastInstanceByName(instanceName);
-        if (existingInstance != null) {
-            try {
-                existingInstance.shutdown();
-                if (!existingInstance.getLifecycleService().isRunning()) {
-                    Trace.info("Instância existente do Hazelcast desligada com sucesso.");
+    private void shutdownExistingInstance(String instanceName, boolean isClientMode) {
+        try {
+            if (isClientMode) {
+                shutdownClientInstance();
+            } else {
+                shutdownServerInstance(instanceName);
+            }
+            
+        } catch (Exception e) {
+            Trace.error("Erro durante o shutdown de instâncias existentes", e);
+        }
+    }
+    
+    private void shutdownClientInstance() {
+        try {
+            if (hazelcastInstance != null) {
+                Trace.info("Desligando instância cliente do Hazelcast...");
+                try {
+                    hazelcastInstance.shutdown();
+                    Trace.info("Instância cliente desligada com sucesso");
+                } catch (Exception e) {
+                    Trace.error("Erro ao desligar instância cliente", e);
+                    // Tenta terminar forçadamente se o shutdown normal falhar
+                    try {
+                        hazelcastInstance.getLifecycleService().terminate();
+                    } catch (Exception ex) {
+                        Trace.error("Erro ao terminar forçadamente a instância cliente", ex);
+                    }
                 }
-            } catch (Exception e) {
-                Trace.error("Erro ao desligar instância existente do Hazelcast", e);
-            } finally {
-                existingInstance = null;
+            }
+        } finally {
+            hazelcastInstance = null;
+            // Pequena pausa para garantir limpeza de recursos
+            try {
+                Thread.sleep(1000);
+            } catch (InterruptedException ie) {
+                Thread.currentThread().interrupt();
             }
         }
     }
 
-    private Config createOptimizedConfig(Properties props, String port, String instanceName) {
+    
+    private void shutdownServerInstance(String instanceName) {
+        try {
+            // Primeiro tenta desligar a instância atual
+            if (hazelcastInstance != null) {
+                Trace.info("Desligando instância servidor atual do Hazelcast...");
+                try {
+                    // Verifica se é seguro desligar
+                    if (hazelcastInstance.getPartitionService().isLocalMemberSafe()) {
+                        hazelcastInstance.shutdown();
+                        Trace.info("Instância servidor atual desligada com sucesso");
+                    } else {
+                        Trace.info("Membro local não está em estado seguro para shutdown");
+                        // Força shutdown após timeout
+                        hazelcastInstance.getLifecycleService().terminate();
+                    }
+                } catch (Exception e) {
+                    Trace.error("Erro ao desligar instância servidor atual", e);
+                }
+            }
+
+            // Procura por outras instâncias servidor com o mesmo nome
+            HazelcastInstance existingInstance = Hazelcast.getHazelcastInstanceByName(instanceName);
+            if (existingInstance != null) {
+                Trace.info("Encontrada outra instância servidor com nome: " + instanceName);
+                try {
+                    existingInstance.shutdown();
+                    if (!existingInstance.getLifecycleService().isRunning()) {
+                        Trace.info("Instância servidor adicional desligada com sucesso");
+                    }
+                } catch (Exception e) {
+                    Trace.error("Erro ao desligar instância servidor adicional", e);
+                }
+            }
+        } finally {
+            hazelcastInstance = null;
+            // Pequena pausa para garantir limpeza de recursos
+            try {
+                Thread.sleep(1000);
+            } catch (InterruptedException ie) {
+                Thread.currentThread().interrupt();
+            }
+        }
+    }    
+    
+    private Config createOptimizedConfig(Properties props) {
         Config config = new Config();
-        config.setInstanceName(instanceName);
-        configureSystemResources(config, props);
+        config.setInstanceName(props.getProperty("env.HAZELCAST.instanceName", DEFAULT_INSTANCE_NAME));
 
-        // Configurações originais
-        configureCPSubsystem(config, props);
+        // Configurações comuns
         configureBasicSettings(config, props);
-        configureDiagnostics(config, props);
-        configureLoggingAndMapSettings(config, props);
         configureNetworkSettings(config, props);
-        configurePerformanceSettings(config, props);
         configureTimeoutSettings(config, props);
-        configureDiscovery(config, props);
-        configureMemoryLimits(config, props);
         configureConnectionLimits(config, props);
-        configureOperationLimits(config, props);
-        configureMetrics(config, props);
-
-        // Otimizações adicionais
-        configureMemoryOptimizations(config, props);
         configureNetworkOptimizations(config, props);
-        configureOperationOptimizations(config, props);
+        configureLoggingAndMapSettings(config, props);
+        
+        // Configurações específicas do servidor
+        if (!Boolean.parseBoolean(props.getProperty("env.HAZELCAST.client.mode.enabled", "false"))) {
+            configureServerSpecificSettings(config, props);
+        }
         
         return config;
+    }
+    
+    private void configureServerSpecificSettings(Config config, Properties props) {
+        configureMemoryLimits(config, props);
+        configureOperationLimits(config, props);
+        configureCPSubsystem(config, props);
+        configureMetrics(config, props);
+        configureMemoryOptimizations(config, props);
+        configureOperationOptimizations(config, props);
+        configureDiagnostics(config, props);
+        configureSystemResources(config, props);
+        configurePerformanceSettings(config, props);
     }
     
     private void configureMetrics(Config config, Properties props) {
@@ -352,8 +593,7 @@ public class HazelcastCacheManager implements LoadableModule {
         config.setProperty("hazelcast.metrics.mc.enabled", "true");
         config.setProperty("hazelcast.metrics.collection.frequency", 
             props.getProperty("env.HAZELCAST.metrics.collection.frequency", "5"));
-    }
-
+    }  
 
     private void configureMemoryOptimizations(Config config, Properties props) {
         // Configurações de memória mais agressivas
@@ -556,7 +796,7 @@ public class HazelcastCacheManager implements LoadableModule {
         config.addMapConfig(rateMapConfig);
         
         // Desabilitar hot restart
-        config.getHotRestartPersistenceConfig().setEnabled(false);
+        config.getPersistenceConfig().setEnabled(false);
 
         // Configurações adicionais para evitar persistência e backup
         config.setProperty("hazelcast.persistence.enabled", "false");
@@ -737,7 +977,7 @@ public class HazelcastCacheManager implements LoadableModule {
             Trace.error("Config é null em configureNetworkSettings");
             throw new IllegalArgumentException("Config não pode ser null");
         }
-    
+
         try {
             NetworkConfig networkConfig = config.getNetworkConfig();
             
@@ -745,7 +985,7 @@ public class HazelcastCacheManager implements LoadableModule {
             networkConfig.setPort(Integer.parseInt(props.getProperty("env.HAZELCAST.port", DEFAULT_PORT)));
             networkConfig.setPortAutoIncrement(true);
             networkConfig.setPortCount(100);
-    
+
             // Habilitar logs do cluster
             config.setProperty("hazelcast.logging.level", "INFO");
             config.setProperty("hazelcast.logging.type", "slf4j");
@@ -766,38 +1006,10 @@ public class HazelcastCacheManager implements LoadableModule {
                 props.getProperty("env.HAZELCAST.socket.receive.buffer.size", "256"));
             config.setProperty("hazelcast.socket.send.buffer.size", 
                 props.getProperty("env.HAZELCAST.socket.send.buffer.size", "256"));
-    
-            // Configurações de join com mais logs
-            JoinConfig joinConfig = networkConfig.getJoin();
-            joinConfig.getMulticastConfig().setEnabled(false);
-    
-            String ipList = props.getProperty("env.HAZELCAST.member.ips");
-            if (ipList != null && !ipList.isEmpty()) {
-                Trace.info("Configurando membros TCP/IP: " + ipList);
-                TcpIpConfig tcpIpConfig = joinConfig.getTcpIpConfig();
-                tcpIpConfig.setEnabled(true);
-                for (String ip : ipList.split(",")) {
-                    tcpIpConfig.addMember(ip.trim());
-                    Trace.info("Adicionado membro: " + ip.trim());
-                }
-            } else {
-                Trace.info("Configurando descoberta via Kubernetes");
-                KubernetesConfig kubernetesConfig = joinConfig.getKubernetesConfig();
-                kubernetesConfig.setEnabled(true);
-                
-                String namespace = props.getProperty("env.HAZELCAST.namespace", "axway");
-                String serviceName = props.getProperty("env.HAZELCAST.serviceName", "traffic");
-                String servicePort = props.getProperty("env.HAZELCAST.servicePort", DEFAULT_PORT);
-                
-                kubernetesConfig.setProperty("namespace", namespace);
-                kubernetesConfig.setProperty("service-name", serviceName);
-                kubernetesConfig.setProperty("service-port", servicePort);
-                
-                Trace.info("Kubernetes configurado - Namespace: " + namespace + 
-                          ", Service: " + serviceName + 
-                          ", Port: " + servicePort);
-            }
-    
+
+            // Usar o método existente para configurar descoberta
+            configureDiscovery(config, props);
+
             Trace.info("Configurações de rede aplicadas com sucesso");
             
         } catch (Exception e) {
@@ -805,6 +1017,7 @@ public class HazelcastCacheManager implements LoadableModule {
             throw new RuntimeException("Falha ao configurar network settings", e);
         }
     }
+
     
     private void monitorClusterMembers(HazelcastInstance hazelcastInstance) {
         if (hazelcastInstance != null) {

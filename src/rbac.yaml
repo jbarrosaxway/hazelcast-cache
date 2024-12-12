@@ -36,8 +36,8 @@ roleRef:
   name: hazelcast-cluster-role
 subjects:
   - kind: ServiceAccount
-    name: apim20230830-gateway-apitraffic
-    namespace: axway
+    name: apigateway-apitraffic
+    namespace: application
   - kind: ServiceAccount
-    name: apim20230830-gateway-apimgr
-    namespace: axway
+    name: apigateway-apimgr
+    namespace: application

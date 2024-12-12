@@ -1,6 +1,6 @@
 # Configuração básica do cluster
 cluster:
-  memberCount: 3
+  memberCount: 2
   cluster-name: "axway-cluster"  # Nome do cluster adicionado aqui
   
 image:
@@ -40,9 +40,10 @@ hazelcast:
       serialization:
         use-native-byte-order: true
         allow-unsafe: true
-        enable-compression: false
-        enable-shared-object: false
+        enable-compression: true
+        enable-shared-object: true
         portable-version: 0
+        
       network:
         join:
           kubernetes:
@@ -66,9 +67,9 @@ hazelcast:
           eviction:
             eviction-policy: LRU
             max-size-policy: FREE_HEAP_PERCENTAGE  
-            size: 20
-          time-to-live-seconds: 1800        # Correto: time-to-live-seconds em vez de ttl-seconds
-          max-idle-seconds: 900             # Este está correto
+            size: 15
+          time-to-live-seconds: 1200
+          max-idle-seconds: 600
           backup-count: 0
           async-backup-count: 0
           statistics-enabled: false
@@ -76,16 +77,20 @@ hazelcast:
           in-memory-format: BINARY
         default:
           backup-count: 1
-          async-backup-count: 1
+          async-backup-count: 0
           eviction:
             eviction-policy: LRU
             max-size-policy: FREE_HEAP_PERCENTAGE
-            size: 20
+            size: 15
       properties:
+        hazelcast.unsafe.mode: "true"
         hazelcast.performance.monitoring.enabled: "true"
         hazelcast.performance.monitoring.delay.seconds: "10"
-        hazelcast.memory.free.min.percentage: "25"
-        hazelcast.memory.free.max.percentage: "35"
+        hazelcast.diagnostics.enabled: "false"
+        hazelcast.diagnostics.directory: "/tmp/hazelcast/diagnostics"
+        hazelcast.diagnostics.metric.level: "INFO"
+        hazelcast.memory.free.min.percentage: "20"
+        hazelcast.memory.free.max.percentage: "30"
         hazelcast.gc.check.period.seconds: "10"
         # Limitar proxies
         hazelcast.max.proxy.count: 1000
@@ -105,11 +110,11 @@ hazelcast:
         hazelcast.operation.call.timeout.millis: "60000"
 
         # Socket Buffer Sizes
-        hazelcast.socket.receive.buffer.size: "131072"
-        hazelcast.socket.send.buffer.size: "131072"
+        hazelcast.socket.receive.buffer.size: "65536"
+        hazelcast.socket.send.buffer.size: "65536"
         # Network Thread Configs
         hazelcast.operation.thread.count: "2"
-        hazelcast.io.thread.count: "3"
+        hazelcast.io.thread.count: "2"
         hazelcast.operation.generic.thread.count: "2"
 
         hazelcast.backup.acks.enabled: "true"
@@ -122,19 +127,19 @@ hazelcast:
         hazelcast.internal.map.expiration.task.period.seconds: "1"
         hazelcast.map.eviction.batch.size: "250"
         hazelcast.map.eviction.cleanup.operation.count: "250"
-        hazelcast.map.expiration.cleanup.operation.count: "500"
-        hazelcast.map.invalidation.batch.size: "250"
+        hazelcast.map.expiration.cleanup.operation.count: "200"
+        hazelcast.map.invalidation.batch.size: "100"
         hazelcast.jmx: "false"
         hazelcast.logging.type: "slf4j"
         
         hazelcast.map.expiration.cleanup.threshold.percent: "25"
         hazelcast.map.invalidation.batch.enabled: "true"
         
-        hazelcast.map.write.behind.queue.capacity: "100"
+        hazelcast.map.write.behind.queue.capacity: "2000"
 
         hazelcast.native.memory.allocator.type: "POOLED"
         hazelcast.native.memory.enabled: "true"
-        hazelcast.operation.backup.timeout.millis: "5000"
+        hazelcast.operation.backup.timeout.millis: "60000"
         
         hazelcast.operation.responsequeue.idlestrategy: "backoff"
         
@@ -145,11 +150,15 @@ hazelcast:
         hazelcast.socket.no.delay: "true"
         hazelcast.wait.seconds.before.join: "5"
 
-        hazelcast.native.memory.size.mb: "3072"  # 3GB
-        hazelcast.native.memory.metadata.space.percentage: "25"
+        hazelcast.native.memory.size.mb: "3072"  # 4GB
+        hazelcast.native.memory.metadata.space.percentage: "20"
+        hazelcast.backpressure.enabled: true
+        hazelcast.backpressure.max.concurrent.invocations.per.partition: "100"
 
-
-
+        # Otimizar operações do CP Subsystem
+        hazelcast.cp.operation.thread.count: "2"
+        hazelcast.cp.operation.timeout.millis: "10000"
+        
 
   # Configurações de JVM
   javaOpts: >-
@@ -157,17 +166,20 @@ hazelcast:
     -Xmx6G
     -XX:+UnlockExperimentalVMOptions
     -XX:+UseG1GC
-    -XX:MaxGCPauseMillis=500
-    -XX:G1HeapRegionSize=32m
+    -XX:MaxGCPauseMillis=50
+    -XX:G1HeapRegionSize=4m
     -XX:+ParallelRefProcEnabled
+    -XX:InitiatingHeapOccupancyPercent=45
     -XX:+UseStringDeduplication
-    -XX:G1NewSizePercent=15
-    -XX:G1MaxNewSizePercent=25
-    -XX:InitiatingHeapOccupancyPercent=35
     -XX:+UseNUMA
     -XX:+AlwaysPreTouch
-    -XX:+DisableExplicitGC
-    -XX:NativeMemoryTracking=detail
+    -XX:+ExplicitGCInvokesConcurrent 
+    -XX:G1NewSizePercent=30
+    -XX:G1MaxNewSizePercent=40
+    -XX:MaxRAMPercentage=75
+    -XX:MinRAMPercentage=50
+    -XX:+UseCompressedOops
+    -XX:+UseCompressedClassPointers
 
 
   # Métricas e monitoramento
@@ -186,17 +198,24 @@ hazelcast:
 resources:
   requests:
     memory: "6Gi"
-    cpu: "2"
+    cpu: "4"
   limits:
     memory: "8Gi"
     cpu: "4"
   # Configurações de afinidade e anti-afinidade
 nodeSelector:
-  agentpool: hazelcast
+  pool: utilities
+
+tolerations:
+- key: "workload"
+  operator: "Equal"
+  value: "utilities"
+  effect: "NoSchedule"
+
 # Configurações de persistência
 persistence:
   enabled: true
-  storageClass: "managed-csi-premium"  # Classe recomendada para produção
+  #storageClass: "default"  # Classe recomendada para produção
   accessModes:
     - ReadWriteOnce
   size: 20Gi
@@ -225,9 +244,10 @@ mancenter:
     type: ClusterIP
     port: 8080
   persistence:
-    enabled: true
+    enabled: false
     size: 20Gi  # Aumentado de 10Gi
-    storageClass: "managed-csi-premium"
+    #storageClass: "managed-csi-premium"
+    #storageClass: "default" 
     accessModes:
       - ReadWriteOnce
   # Configurar volume para heap dumps
@@ -304,7 +324,8 @@ mancenter:
       kubernetes.io/ingress.class: nginx
       nginx.ingress.kubernetes.io/ssl-redirect: "false"
     hosts:
-      - hazelcast-mc.20230830.demo-latam.axway.com
+      #- hazelcast-mc.20230830.demo-latam.axway.com
+      - hazelcast-mc.perfenv.apigw.axwaytest.net
   yaml:
     hazelcast-client:
       cluster-name: "axway-cluster"
